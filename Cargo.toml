@@ -1,0 +1,23 @@
+[package]
+name = "rst_queue"
+version = "0.1.0"
+edition = "2021"
+authors = ["Suraj Kalbande <suraj202923@gmail.com>"]
+license = "MIT"
+description = "High-performance async queue system built with Rust and Crossbeam"
+repository = "https://github.com/suraj202923/rst_queue"
+homepage = "https://github.com/suraj202923/rst_queue"
+readme = "README.md"
+keywords = ["queue", "async", "crossbeam", "concurrent"]
+categories = ["data-structures", "concurrency"]
+
+[dependencies]
+crossbeam-channel = "0.5"
+
+[[bin]]
+name = "queue_example"
+path = "src/bin/example.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
