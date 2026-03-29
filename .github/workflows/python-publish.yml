@@ -26,11 +26,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build release distributions
+      - name: Build package
         run: |
-          # NOTE: put your own distribution build steps here.
-          python -m pip install build
-          python -m build
+          pip install maturin
+          maturin build --release --interpreter python3.12
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4
