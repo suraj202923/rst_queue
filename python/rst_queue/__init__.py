@@ -15,11 +15,20 @@ Quick Usage:
     queue.push(b"Hello World")
     queue.start(worker, num_workers=4)
 
-    stats = queue.get_stats()
-    print(f"Processed: {stats.total_processed}/{stats.total_pushed}")
+    # Get results if using start_with_results
+    def result_worker(item_id, data):
+        return b"processed: " + data
+
+    queue2 = AsyncQueue(mode=ExecutionMode.PARALLEL, buffer_size=128)
+    queue2.push(b"Hello")
+    queue2.start_with_results(result_worker, num_workers=4)
+
+    # Retrieve result
+    result = queue2.get_blocking()
+    print(f"Result: {result.result}")
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "Suraj Kalbande"
 __email__ = "suraj202923@gmail.com"
 __license__ = "MIT"
@@ -29,14 +38,15 @@ from enum import IntEnum
 # Try to import the compiled Rust module
 try:
     from rst_queue._rst_queue import (
-        AsyncQueue as _RustAsyncQueue,
-        ExecutionMode as _RustExecutionMode,
-        QueueStats as _RustQueueStats,
+        PyAsyncQueue,
+        PyQueueStats,
+        PyProcessedResult,
     )
     
-    # Use Rust implementation with PyO3 bindings
-    AsyncQueue = _RustAsyncQueue
-    QueueStats = _RustQueueStats
+    # Export with friendly names
+    AsyncQueue = PyAsyncQueue
+    QueueStats = PyQueueStats
+    ProcessedResult = PyProcessedResult
     _use_rust = True
 except ImportError:
     # Fallback to pure Python implementation
@@ -80,6 +90,7 @@ __all__ = [
     "AsyncQueue",
     "ExecutionMode",
     "QueueStats",
+    "ProcessedResult",
     "__version__",
     "__author__",
 ]

@@ -147,6 +147,71 @@ while queue.total_processed() < 100:
 print("All items processed!")
 ```
 
+### Example: Async Results with get()
+
+```python
+from rst_queue import AsyncQueue, ExecutionMode
+import time
+
+def process_with_result(item_id, data):
+    """Worker that returns a processed result"""
+    result = b"Processed: " + data
+    time.sleep(0.1)
+    return result
+
+queue = AsyncQueue(mode=ExecutionMode.PARALLEL, buffer_size=128)
+
+# Push items
+for i in range(5):
+    queue.push(f"data_{i}".encode())
+
+# Start with result-returning workers
+queue.start_with_results(process_with_result, num_workers=2)
+
+# Non-blocking retrieval
+print("Retrieving results (non-blocking):")
+retrieved = 0
+timeout = time.time() + 5
+
+while retrieved < 5 and time.time() < timeout:
+    result = queue.get()  # Non-blocking - returns None if no result ready
+    if result:
+        print(f"  Item {result.id}: {result.result.decode()}")
+        retrieved += 1
+    else:
+        time.sleep(0.05)
+
+print(f"Retrieved {retrieved} results")
+```
+
+### Example: Blocking get_blocking()
+
+```python
+from rst_queue import AsyncQueue
+import time
+
+def compute(item_id, data):
+    """Worker that computes and returns a result"""
+    result = f"Computed[{item_id}]: {data.decode()}".encode()
+    return result
+
+queue = AsyncQueue(mode=0, buffer_size=128)  # Sequential mode
+
+# Push items
+queue.push(b"value_1")
+queue.push(b"value_2")
+queue.push(b"value_3")
+
+# Start with results
+queue.start_with_results(compute, num_workers=1)
+
+# Blocking retrieval - waits until result is available
+print("Blocking result retrieval:")
+for _ in range(3):
+    result = queue.get_blocking()  # Blocks until a result is available
+    print(f"  Item {result.id}: {result.result.decode()}")
+```
+
 ## API Reference
 
 ### AsyncQueue
@@ -214,6 +279,73 @@ print(f"Errors: {stats.total_errors}")
 print(f"Active: {stats.active_workers}")
 ```
 
+##### `start_with_results(worker: Callable, num_workers: int = 1) -> None`
+Start processing items with a worker that returns results.
+
+- `worker`: Function with signature `(item_id: int, data: bytes) -> bytes`
+- `num_workers`: Number of parallel workers (ignored in sequential mode)
+- Results are stored in an internal result queue and can be retrieved using `get()` or `get_blocking()`
+
+```python
+def result_worker(item_id, data):
+    processed = b"Result: " + data
+    return processed
+
+queue = AsyncQueue(mode=1, buffer_size=128)
+queue.push(b"data1")
+queue.push(b"data2")
+
+queue.start_with_results(result_worker, num_workers=4)
+
+# Retrieve results...
+```
+
+##### `get() -> ProcessedResult | None`
+Non-blocking retrieval of a processed result.
+
+- Returns: `ProcessedResult` if available, `None` if no result ready
+- Does not block; useful for polling-style result retrieval
+
+```python
+result = queue.get()
+if result:
+    print(f"Got result for item {result.id}: {result.result}")
+else:
+    print("No result available yet")
+```
+
+##### `get_blocking() -> ProcessedResult`
+Blocking retrieval of a processed result.
+
+- Blocks until a result is available
+- Useful for sequential processing or when you know results are coming
+
+```python
+# This will block until a result is available
+result = queue.get_blocking()
+print(f"Item {result.id}: {result.result.decode()}")
+```
+
+### ProcessedResult
+
+Represents a processed item returned from a result-returning worker.
+
+**Properties:**
+- `id: int` - The item ID that was processed
+- `result: bytes` - The result data from the worker
+- `error: str | None` - Error message if one occurred (None for success)
+
+**Methods:**
+- `is_error() -> bool` - Returns True if the result represents an error
+
+```python
+result = queue.get()
+if result.is_error():
+    print(f"Error processing item {result.id}: {result.error}")
+else:
+    print(f"Success: {result.result.decode()}")
+```
+
 ## Error Handling
 
 ```python
@@ -232,6 +364,37 @@ queue.push(b"data1")
 queue.push(b"data2")
 
 queue.start(safe_worker, num_workers=4)
+```
+
+### Error Handling with Results
+
+```python
+from rst_queue import AsyncQueue
+
+def worker_with_error_handling(item_id, data):
+    try:
+        if b"invalid" in data:
+            raise ValueError("Invalid data")
+        return b"Success: " + data
+    except Exception as e:
+        raise Exception(f"Error: {e}")
+
+queue = AsyncQueue()
+queue.push(b"valid_data")
+queue.push(b"invalid_data")
+
+queue.start_with_results(worker_with_error_handling, num_workers=2)
+
+# Retrieve and check results
+while True:
+    result = queue.get()
+    if result:
+        if result.is_error():
+            print(f"Error for item {result.id}: {result.error}")
+        else:
+            print(f"Success for item {result.id}: {result.result}")
+    else:
+        break
 ```
 
 ## Performance
