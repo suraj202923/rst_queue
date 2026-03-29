@@ -10,6 +10,7 @@ use std::sync::Arc;
 fn _rst_queue(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncQueue>()?;
     m.add_class::<PyQueueStats>()?;
+    m.add_class::<PyProcessedResult>()?;
     Ok(())
 }
 
@@ -49,6 +50,48 @@ impl PyQueueStats {
             "QueueStats(total_pushed={}, total_processed={}, total_errors={}, active_workers={})",
             self.total_pushed, self.total_processed, self.total_errors, self.active_workers
         )
+    }
+}
+
+/// Python wrapper for ProcessedResult
+#[pyclass(module = "rst_queue._rst_queue")]
+pub struct PyProcessedResult {
+    pub id: u64,
+    pub result: Vec<u8>,
+    pub error: Option<String>,
+}
+
+#[pymethods]
+impl PyProcessedResult {
+    /// Item ID that was processed
+    #[getter]
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Result data (empty if error occurred)
+    #[getter]
+    fn result(&self) -> &[u8] {
+        &self.result
+    }
+
+    /// Error message if one occurred
+    #[getter]
+    fn error(&self) -> Option<String> {
+        self.error.clone()
+    }
+
+    /// Check if result represents an error
+    fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    fn __repr__(&self) -> String {
+        if let Some(ref err) = self.error {
+            format!("ProcessedResult(id={}, error={})", self.id, err)
+        } else {
+            format!("ProcessedResult(id={}, result={} bytes)", self.id, self.result.len())
+        }
     }
 }
 
@@ -130,7 +173,7 @@ impl PyAsyncQueue {
         })
     }
 
-    /// Start processing queue items
+    /// Start processing queue items (fire-and-forget)
     ///
     /// Args:
     ///     worker: A callable that accepts (item_id: int, data: bytes)
@@ -139,13 +182,80 @@ impl PyAsyncQueue {
         // Create a wrapper function that calls the Python callable
         let worker = Arc::new(move |id: u64, data: Vec<u8>| {
             Python::with_gil(|py| {
-                if let Err(e) = worker.call1(py, (id, data)) {
+                // Convert Vec<u8> to Python bytes
+                let py_bytes = pyo3::types::PyBytes::new_bound(py, &data);
+                if let Err(e) = worker.call1(py, (id, py_bytes)) {
                     eprintln!("Error in worker: {}", e);
                 }
             });
         });
 
         self.inner.start(worker, num_workers)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Get a processed result (non-blocking)
+    ///
+    /// Returns:
+    ///     ProcessedResult or None if no results available
+    fn get(&self) -> Option<PyProcessedResult> {
+        self.inner.get().map(|r| PyProcessedResult {
+            id: r.id,
+            result: r.result,
+            error: r.error,
+        })
+    }
+
+    /// Get a processed result (blocking)
+    ///
+    /// Blocks until a result is available
+    ///
+    /// Returns:
+    ///     ProcessedResult
+    fn get_blocking(&self) -> PyResult<PyProcessedResult> {
+        let result = self.inner.get_blocking()
+            .map_err(|e| PyTypeError::new_err(e))?;
+        Ok(PyProcessedResult {
+            id: result.id,
+            result: result.result,
+            error: result.error,
+        })
+    }
+
+    /// Start processing with a worker that returns results
+    ///
+    /// Args:
+    ///     worker: A callable that accepts (item_id: int, data: bytes) and returns bytes
+    ///     num_workers: Number of parallel workers (default: 1)
+    ///
+    /// Results can be retrieved via get() or get_blocking()
+    fn start_with_results(&mut self, worker: PyObject, num_workers: usize) -> PyResult<()> {
+        // Create a wrapper function that calls the Python callable and gets results
+        let worker = Arc::new(move |id: u64, data: Vec<u8>| -> Result<Vec<u8>, String> {
+            Python::with_gil(|py| {
+                // Convert Vec<u8> to Python bytes
+                let py_bytes = pyo3::types::PyBytes::new_bound(py, &data);
+                
+                match worker.call1(py, (id, py_bytes)) {
+                    Ok(result) => {
+                        // Try to extract bytes from the result
+                        match result.extract::<Vec<u8>>(py) {
+                            Ok(bytes) => Ok(bytes),
+                            Err(_) => {
+                                // Try to convert to string representation
+                                match result.extract::<String>(py) {
+                                    Ok(s) => Ok(s.into_bytes()),
+                                    Err(e) => Err(format!("Failed to extract result: {}", e)),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => Err(format!("Worker error: {}", e)),
+                }
+            })
+        });
+
+        self.inner.start_with_results(worker, num_workers)
             .map_err(|e| PyTypeError::new_err(e))
     }
 }

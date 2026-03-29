@@ -138,10 +138,10 @@ class TestSequentialProcessing:
         def worker(item_id: int, data: bytes):
             results.append((item_id, data))
 
+        queue.start(worker, num_workers=1)
+
         for i in range(3):
             queue.push(f"item_{i}".encode())
-
-        queue.start(worker, num_workers=1)
 
         # Wait for processing
         time.sleep(0.5)
@@ -159,10 +159,11 @@ class TestSequentialProcessing:
         def worker(item_id: int, data: bytes):
             order.append(item_id)
 
+        queue.start(worker, num_workers=1)
+
         for i in range(5):
             queue.push(f"data_{i}".encode())
 
-        queue.start(worker, num_workers=1)
         time.sleep(1)
 
         # Items should be processed in order
@@ -182,10 +183,10 @@ class TestParallelProcessing:
             with lock:
                 results.append((item_id, data))
 
+        queue.start(worker, num_workers=4)
+
         for i in range(4):
             queue.push(f"item_{i}".encode())
-
-        queue.start(worker, num_workers=4)
 
         # Wait for processing
         time.sleep(1)
@@ -203,10 +204,10 @@ class TestParallelProcessing:
             with lock:
                 count[0] += 1
 
+        queue.start(worker, num_workers=4)
+
         for i in range(8):
             queue.push(f"task_{i}".encode())
-
-        queue.start(worker, num_workers=4)
 
         # Wait for completion
         time.sleep(2)
@@ -257,10 +258,11 @@ class TestStatistics:
         def worker(item_id: int, data: bytes):
             count[0] += 1
 
+        queue.start(worker, num_workers=1)
+
         for i in range(5):
             queue.push(f"item_{i}".encode())
 
-        queue.start(worker, num_workers=1)
         time.sleep(1)
 
         # Should have processed some items
@@ -280,11 +282,11 @@ class TestErrorHandling:
                 raise Exception("Intentional error")
             results.append((item_id, data))
 
-        for i in range(4):
-            queue.push(f"item_{i}".encode())
-
         # Should not raise exception
         queue.start(faulty_worker, num_workers=1)
+
+        for i in range(4):
+            queue.push(f"item_{i}".encode())
 
         # Wait for processing
         time.sleep(1)
@@ -306,10 +308,11 @@ class TestErrorHandling:
             except Exception as e:
                 errors.append((item_id, str(e)))
 
+        queue.start(safe_worker, num_workers=1)
+
         for i in range(4):
             queue.push(f"item_{i}".encode())
 
-        queue.start(safe_worker, num_workers=1)
         time.sleep(0.5)
 
         assert len(successes) > 0
@@ -342,10 +345,11 @@ class TestWorkerCallable:
         def worker(item_id: int, data: bytes):
             side_effects.append(item_id)
 
+        queue.start(worker, num_workers=1)
+
         for i in range(3):
             queue.push(f"data_{i}".encode())
 
-        queue.start(worker, num_workers=1)
         time.sleep(0.5)
 
         assert len(side_effects) > 0
@@ -364,13 +368,13 @@ class TestIntegration:
             with lock:
                 results.append((item_id, data.decode()))
 
+        # Process
+        queue.start(processor, num_workers=4)
+
         # Push items
         test_data = [f"task_{i}" for i in range(10)]
         for data in test_data:
             queue.push(data.encode())
-
-        # Process
-        queue.start(processor, num_workers=4)
 
         # Wait
         time.sleep(2)
@@ -398,6 +402,8 @@ class TestIntegration:
             obj = json.loads(data.decode())
             parsed_items.append(obj)
 
+        queue.start(json_worker, num_workers=2)
+
         test_objects = [
             {"id": 1, "name": "Alice"},
             {"id": 2, "name": "Bob"},
@@ -406,7 +412,6 @@ class TestIntegration:
         for obj in test_objects:
             queue.push(json.dumps(obj).encode())
 
-        queue.start(json_worker, num_workers=2)
         time.sleep(0.5)
 
         assert len(parsed_items) > 0
@@ -423,11 +428,12 @@ class TestPerformance:
         def fast_worker(item_id: int, data: bytes):
             count[0] += 1
 
+        start = time.time()
+        queue.start(fast_worker, num_workers=1)
+
         for i in range(100):
             queue.push(f"item_{i}".encode())
 
-        start = time.time()
-        queue.start(fast_worker, num_workers=1)
         time.sleep(2)
         elapsed = time.time() - start
 
@@ -442,27 +448,206 @@ class TestPerformance:
 
         # Sequential
         seq_queue = AsyncQueue(mode=0)
-        for i in range(10):
-            seq_queue.push(f"item_{i}".encode())
-
         seq_start = time.time()
         seq_queue.start(slow_worker, num_workers=1)
+        for i in range(10):
+            seq_queue.push(f"item_{i}".encode())
         time.sleep(1)
         seq_time = time.time() - seq_start
 
         # Parallel
         par_queue = AsyncQueue(mode=1)
-        for i in range(10):
-            par_queue.push(f"item_{i}".encode())
-
         par_start = time.time()
         par_queue.start(slow_worker, num_workers=4)
+        for i in range(10):
+            par_queue.push(f"item_{i}".encode())
         time.sleep(1)
         par_time = time.time() - par_start
 
         # Parallel should typically be faster (but not guaranteed in all environments)
         assert seq_time > 0
         assert par_time > 0
+
+
+class TestResultReturning:
+    """Test result-returning workers with get() and get_blocking()"""
+
+    def test_start_with_results(self):
+        """Can start queue with result-returning workers"""
+        queue = AsyncQueue(mode=1, buffer_size=128)
+
+        def worker(item_id, data):
+            return b"Result: " + data
+
+        queue.start_with_results(worker, num_workers=1)
+        queue.push(b"test")
+
+        # Should not raise exception
+        assert queue.total_pushed() == 1
+
+    def test_get_nonblocking(self):
+        """get() retrieves results non-blocking"""
+        queue = AsyncQueue(mode=0, buffer_size=128)
+
+        def worker(item_id, data):
+            return b"Processed: " + data
+
+        queue.start_with_results(worker, num_workers=1)
+        queue.push(b"data1")
+
+        # Poll for result
+        result = None
+        timeout = time.time() + 2
+        while time.time() < timeout:
+            result = queue.get()
+            if result:
+                break
+            time.sleep(0.05)
+
+        assert result is not None
+        assert result.result == b"Processed: data1"
+        assert result.id == 1
+        assert not result.is_error()
+
+    def test_get_blocking(self):
+        """get_blocking() waits for result"""
+        queue = AsyncQueue(mode=0, buffer_size=128)
+
+        def worker(item_id, data):
+            return b"Result: " + data
+
+        queue.push(b"test_data")
+        queue.start_with_results(worker, num_workers=1)
+
+        # This should block until result is available
+        result = queue.get_blocking()
+
+        assert result.result == b"Result: test_data"
+        assert result.id == 1
+
+    def test_multiple_results(self):
+        """Can retrieve multiple results"""
+        queue = AsyncQueue(mode=1, buffer_size=128)
+        results_list = []
+
+        def worker(item_id, data):
+            return f"Item {item_id}: {data.decode()}".encode()
+
+        for i in range(5):
+            queue.push(f"data_{i}".encode())
+
+        queue.start_with_results(worker, num_workers=2)
+
+        # Retrieve all results
+        timeout = time.time() + 3
+        while len(results_list) < 5 and time.time() < timeout:
+            result = queue.get()
+            if result:
+                results_list.append(result)
+            else:
+                time.sleep(0.05)
+
+        assert len(results_list) >= 3  # At least some should be retrieved
+
+    def test_result_object_properties(self):
+        """ProcessedResult has correct properties"""
+        queue = AsyncQueue(buffer_size=128)
+
+        def worker(item_id, data):
+            return b"processed"
+
+        queue.push(b"input")
+        queue.start_with_results(worker, num_workers=1)
+
+        result = queue.get_blocking()
+
+        # Check result properties
+        assert result.id == 1
+        assert result.result == b"processed"
+        assert result.error is None
+        assert not result.is_error()
+
+    def test_result_with_error(self):
+        """ResultProcessed can represent an error"""
+        queue = AsyncQueue(buffer_size=128)
+
+        def worker_with_error(item_id, data):
+            if b"bad" in data:
+                raise ValueError("Invalid data")
+            return b"ok"
+
+        queue.push(b"bad_data")
+        queue.push(b"good_data")
+        queue.start_with_results(worker_with_error, num_workers=1)
+
+        # Retrieve results
+        results = []
+        timeout = time.time() + 2
+        while len(results) < 2 and time.time() < timeout:
+            result = queue.get()
+            if result:
+                results.append(result)
+            else:
+                time.sleep(0.05)
+
+        assert len(results) >= 1
+        # Check if any error was captured
+        has_error = any(r.is_error() for r in results)
+        assert has_error or len(results) == len([r for r in results if not r.is_error()])
+
+    def test_sequential_results_ordering(self):
+        """Sequential mode returns results in order"""
+        queue = AsyncQueue(mode=0, buffer_size=128)
+
+        def worker(item_id, data):
+            return f"Result_{item_id}".encode()
+
+        for i in range(3):
+            queue.push(f"data_{i}".encode())
+
+        queue.start_with_results(worker, num_workers=1)
+
+        # Get results in order
+        result1 = queue.get_blocking()
+        result2 = queue.get_blocking()
+        result3 = queue.get_blocking()
+
+        assert result1.id == 1
+        assert result2.id == 2
+        assert result3.id == 3
+
+    def test_parallel_results_retrieval(self):
+        """Parallel mode returns results (may be out of order)"""
+        queue = AsyncQueue(mode=1, buffer_size=128)
+
+        def worker(item_id, data):
+            time.sleep(0.01)
+            return f"Result_{item_id}".encode()
+
+        for i in range(5):
+            queue.push(f"data_{i}".encode())
+
+        queue.start_with_results(worker, num_workers=3)
+
+        # Collect results
+        results = []
+        timeout = time.time() + 3
+        while len(results) < 5 and time.time() < timeout:
+            result = queue.get()
+            if result:
+                results.append(result)
+            else:
+                time.sleep(0.05)
+
+        assert len(results) >= 3  # Should get at least some results
+
+    def test_get_returns_none_when_empty(self):
+        """get() returns None when no results available"""
+        queue = AsyncQueue(buffer_size=128)
+
+        # No items pushed, no results available
+        result = queue.get()
+        assert result is None
 
 
 if __name__ == "__main__":

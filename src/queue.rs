@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{bounded, Sender, Receiver};
 
 /// Execution mode for the queue
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,8 +36,19 @@ pub struct QueueItem {
     pub data: Vec<u8>,
 }
 
-/// Worker function type for processing queue items
+/// Processed result returned from worker
+#[derive(Clone, Debug)]
+pub struct ProcessedResult {
+    pub id: u64,
+    pub result: Vec<u8>,
+    pub error: Option<String>,
+}
+
+/// Worker function type for processing queue items (fire-and-forget)
 pub type WorkerFn = Arc<dyn Fn(u64, Vec<u8>) + Send + Sync>;
+
+/// Worker function type that returns results
+pub type ResultWorkerFn = Arc<dyn Fn(u64, Vec<u8>) -> Result<Vec<u8>, String> + Send + Sync>;
 
 /// Queue statistics
 #[derive(Clone, Debug)]
@@ -50,7 +61,10 @@ pub struct QueueStats {
 
 /// Async Queue with parallel/sequential processing capabilities
 pub struct AsyncQueue {
-    sender: Arc<Mutex<Option<Sender<QueueItem>>>>,
+    sender: Arc<Mutex<Sender<QueueItem>>>,
+    receiver_for_queue: Arc<Mutex<Option<Receiver<QueueItem>>>>,
+    result_sender: Arc<Mutex<Option<Sender<ProcessedResult>>>>,
+    result_receiver: Arc<Mutex<Option<Receiver<ProcessedResult>>>>,
     mode: Arc<Mutex<ExecutionMode>>,
     counter: Arc<Mutex<u64>>,
     active_workers: Arc<Mutex<usize>>,
@@ -71,11 +85,16 @@ impl AsyncQueue {
     /// ```
     /// let queue = AsyncQueue::new(1, 128).expect("Failed to create queue");
     /// ```
-    pub fn new(mode: u8, _buffer_size: usize) -> Result<Self, String> {
+    pub fn new(mode: u8, buffer_size: usize) -> Result<Self, String> {
         let execution_mode = ExecutionMode::from_int(mode);
+        let (tx, rx) = bounded::<QueueItem>(buffer_size);
+        let (result_tx, result_rx) = bounded::<ProcessedResult>(buffer_size);
 
         Ok(AsyncQueue {
-            sender: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(tx)),
+            receiver_for_queue: Arc::new(Mutex::new(Some(rx))),
+            result_sender: Arc::new(Mutex::new(Some(result_tx))),
+            result_receiver: Arc::new(Mutex::new(Some(result_rx))),
             mode: Arc::new(Mutex::new(execution_mode)),
             counter: Arc::new(Mutex::new(0)),
             active_workers: Arc::new(Mutex::new(0)),
@@ -94,11 +113,10 @@ impl AsyncQueue {
         let id = *counter;
         drop(counter);
 
-        if let Some(ref tx) = *sender_arc.lock().unwrap() {
-            let item = QueueItem { id, data };
-            tx.send(item)
-                .map_err(|e| format!("Failed to send item: {}", e))?;
-        }
+        let tx = sender_arc.lock().unwrap();
+        let item = QueueItem { id, data };
+        tx.send(item)
+            .map_err(|e| format!("Failed to send item: {}", e))?;
         Ok(())
     }
 
@@ -144,6 +162,142 @@ impl AsyncQueue {
         }
     }
 
+    /// Get a processed result from the result queue (non-blocking)
+    ///
+    /// Returns None if no results are available
+    pub fn get(&self) -> Option<ProcessedResult> {
+        if let Some(ref rx) = *self.result_receiver.lock().unwrap() {
+            rx.try_recv().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Block and get a processed result (blocking)
+    pub fn get_blocking(&self) -> Result<ProcessedResult, String> {
+        let rx_arc = Arc::clone(&self.result_receiver);
+        let rx_guard = rx_arc.lock().unwrap();
+        
+        if let Some(ref rx) = *rx_guard {
+            rx.recv().map_err(|e| format!("Failed to receive result: {}", e))
+        } else {
+            Err("Result receiver not available".to_string())
+        }
+    }
+
+    /// Start the queue with a worker function that returns results
+    ///
+    /// # Arguments
+    ///
+    /// * `worker` - A function that processes items and returns results
+    /// * `num_workers` - Number of parallel workers (ignored in sequential mode)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let queue = AsyncQueue::new(1, 128).unwrap();
+    /// let worker = Arc::new(|id: u64, data: Vec<u8>| {
+    ///     let result = format!("Processed: {:?}", data);
+    ///     Ok(result.into_bytes())
+    /// });
+    /// queue.start_with_results(worker, 4).unwrap();
+    /// ```
+    pub fn start_with_results(&mut self, worker: ResultWorkerFn, num_workers: usize) -> Result<(), String> {
+        let mode = *self.mode.lock().unwrap();
+
+        // Extract the receiver (take ownership)
+        let receiver = {
+            let mut rx_guard = self.receiver_for_queue.lock().unwrap();
+            rx_guard.take().ok_or("Queue already started")?
+        };
+
+        // Update result channels for starting workers
+        let (result_tx, result_rx) = bounded::<ProcessedResult>(128);
+        *self.result_sender.lock().unwrap() = Some(result_tx.clone());
+        *self.result_receiver.lock().unwrap() = Some(result_rx);
+
+        let rx_arc = Arc::new(receiver);
+
+        match mode {
+            ExecutionMode::Sequential => {
+                let rx_clone = Arc::clone(&rx_arc);
+                let worker_clone = Arc::clone(&worker);
+                let active_clone = Arc::clone(&self.active_workers);
+                let processed_clone = Arc::clone(&self.processed_count);
+                let error_clone = Arc::clone(&self.error_count);
+                let result_tx = result_tx.clone();
+
+                std::thread::spawn(move || {
+                    for item in rx_clone.iter() {
+                        *active_clone.lock().unwrap() += 1;
+                        let result = worker_clone(item.id, item.data);
+                        
+                        match result {
+                            Ok(output) => {
+                                let _ = result_tx.send(ProcessedResult {
+                                    id: item.id,
+                                    result: output,
+                                    error: None,
+                                });
+                                *processed_clone.lock().unwrap() += 1;
+                            }
+                            Err(e) => {
+                                let _ = result_tx.send(ProcessedResult {
+                                    id: item.id,
+                                    result: Vec::new(),
+                                    error: Some(e),
+                                });
+                                *error_clone.lock().unwrap() += 1;
+                                *processed_clone.lock().unwrap() += 1;
+                            }
+                        }
+                        *active_clone.lock().unwrap() -= 1;
+                    }
+                });
+            }
+            ExecutionMode::Parallel => {
+                for _ in 0..num_workers {
+                    let rx_clone = Arc::clone(&rx_arc);
+                    let worker_clone = Arc::clone(&worker);
+                    let active_clone = Arc::clone(&self.active_workers);
+                    let processed_clone = Arc::clone(&self.processed_count);
+                    let error_clone = Arc::clone(&self.error_count);
+                    let result_tx = result_tx.clone();
+
+                    std::thread::spawn(move || {
+                        for item in rx_clone.iter() {
+                            *active_clone.lock().unwrap() += 1;
+                            let result = worker_clone(item.id, item.data);
+                            
+                            match result {
+                                Ok(output) => {
+                                    let _ = result_tx.send(ProcessedResult {
+                                        id: item.id,
+                                        result: output,
+                                        error: None,
+                                    });
+                                    *processed_clone.lock().unwrap() += 1;
+                                }
+                                Err(e) => {
+                                    let _ = result_tx.send(ProcessedResult {
+                                        id: item.id,
+                                        result: Vec::new(),
+                                        error: Some(e),
+                                    });
+                                    *error_clone.lock().unwrap() += 1;
+                                    *processed_clone.lock().unwrap() += 1;
+                                }
+                            }
+                            *active_clone.lock().unwrap() -= 1;
+                        }
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Start the queue with a worker function
     ///
     /// # Arguments
@@ -161,14 +315,15 @@ impl AsyncQueue {
     /// queue.start(worker, 4).unwrap();
     /// ```
     pub fn start(&mut self, worker: WorkerFn, num_workers: usize) -> Result<(), String> {
-        let (tx, rx) = bounded::<QueueItem>(128);
-
         let mode = *self.mode.lock().unwrap();
 
-        // Store sender
-        *self.sender.lock().unwrap() = Some(tx);
+        // Extract the receiver (take ownership)
+        let receiver = {
+            let mut rx_guard = self.receiver_for_queue.lock().unwrap();
+            rx_guard.take().ok_or("Queue already started")?
+        };
 
-        let rx_arc = Arc::new(Mutex::new(Some(rx)));
+        let rx_arc = Arc::new(receiver);
 
         match mode {
             ExecutionMode::Sequential => {
@@ -178,13 +333,11 @@ impl AsyncQueue {
                 let processed_clone = Arc::clone(&self.processed_count);
 
                 std::thread::spawn(move || {
-                    if let Some(receiver) = rx_clone.lock().unwrap().take() {
-                        for item in receiver {
-                            *active_clone.lock().unwrap() += 1;
-                            worker_clone(item.id, item.data);
-                            *processed_clone.lock().unwrap() += 1;
-                            *active_clone.lock().unwrap() -= 1;
-                        }
+                    for item in rx_clone.iter() {
+                        *active_clone.lock().unwrap() += 1;
+                        worker_clone(item.id, item.data);
+                        *processed_clone.lock().unwrap() += 1;
+                        *active_clone.lock().unwrap() -= 1;
                     }
                 });
             }
@@ -196,13 +349,11 @@ impl AsyncQueue {
                     let processed_clone = Arc::clone(&self.processed_count);
 
                     std::thread::spawn(move || {
-                        if let Some(receiver) = rx_clone.lock().unwrap().take() {
-                            for item in receiver {
-                                *active_clone.lock().unwrap() += 1;
-                                worker_clone(item.id, item.data);
-                                *processed_clone.lock().unwrap() += 1;
-                                *active_clone.lock().unwrap() -= 1;
-                            }
+                        for item in rx_clone.iter() {
+                            *active_clone.lock().unwrap() += 1;
+                            worker_clone(item.id, item.data);
+                            *processed_clone.lock().unwrap() += 1;
+                            *active_clone.lock().unwrap() -= 1;
                         }
                     });
                 }
