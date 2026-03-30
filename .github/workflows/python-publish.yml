@@ -44,4 +44,4 @@ jobs:
       - name: Publish to PyPI
         run: |
           pip install twine
-          twine upload wheels/**/*.whl wheels/**/*.tar.gz -u __token__ -p ${{ secrets.PYPI_API_TOKEN }}
+          twine upload wheels/**/*.whl -u __token__ -p ${{ secrets.PYPI_API_TOKEN }}
