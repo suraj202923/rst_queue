@@ -5,23 +5,43 @@ on:
     types: [published]
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12"  # only needed for build tools
 
       - name: Install maturin
         run: pip install maturin
 
       - name: Build wheels
-        run: maturin build --release --interpreter python3.12
+        run: maturin build --release
+
+      - name: Upload wheels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: target/wheels/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels
 
       - name: Publish to PyPI
         run: |
           pip install twine
-          twine upload target/wheels/* -u __token__ -p ${{ secrets.PYPI_API_TOKEN }}
+          twine upload wheels/** -u __token__ -p ${{ secrets.PYPI_API_TOKEN }}
