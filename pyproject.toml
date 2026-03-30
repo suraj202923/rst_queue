@@ -7,7 +7,6 @@ name = "rst-queue"
 version = "0.1.1"
 description = "High-performance async queue system built with Rust and Crossbeam"
 requires-python = ">=3.8"
-license = { file = "LICENSE" }
 authors = [
     { name = "Suraj Kalbande", email = "suraj202923@gmail.com" },
 ]

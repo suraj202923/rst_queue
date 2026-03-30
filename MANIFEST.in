@@ -1,5 +1,4 @@
 include README.md
-include LICENSE
 include SETUP.md
 include CONTRIBUTING.md
 include CONTRIBUTORS.md
