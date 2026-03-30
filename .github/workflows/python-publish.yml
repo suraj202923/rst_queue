@@ -25,6 +25,10 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
+      - name: Remove LICENSE file before build
+        run: rm -f LICENSE
+        shell: bash
+
       - name: Build wheels
         run: maturin build --release
 
