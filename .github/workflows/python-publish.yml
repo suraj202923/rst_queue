@@ -16,8 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Clean old builds
         run: |
-          rm -rf target
-          rm -rf dist
+          rm -rf target dist
+        shell: bash
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"  # only needed for build tools
