@@ -175,10 +175,13 @@ impl AsyncQueue {
 
     /// Block and get a processed result (blocking)
     pub fn get_blocking(&self) -> Result<ProcessedResult, String> {
-        let rx_arc = Arc::clone(&self.result_receiver);
-        let rx_guard = rx_arc.lock().unwrap();
+        // Get a clone of the receiver without holding the mutex across the blocking call
+        let rx = {
+            let rx_guard = self.result_receiver.lock().unwrap();
+            rx_guard.as_ref().map(|rx| rx.clone())
+        };
         
-        if let Some(ref rx) = *rx_guard {
+        if let Some(rx) = rx {
             rx.recv().map_err(|e| format!("Failed to receive result: {}", e))
         } else {
             Err("Result receiver not available".to_string())
