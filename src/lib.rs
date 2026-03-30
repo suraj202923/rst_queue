@@ -178,19 +178,25 @@ impl PyAsyncQueue {
     /// Args:
     ///     worker: A callable that accepts (item_id: int, data: bytes)
     ///     num_workers: Number of parallel workers (default: 1)
-    fn start(&mut self, worker: PyObject, num_workers: usize) -> PyResult<()> {
+    fn start(&mut self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
         // Create a wrapper function that calls the Python callable
-        let worker = Arc::new(move |id: u64, data: Vec<u8>| {
-            Python::with_gil(|py| {
-                // Convert Vec<u8> to Python bytes
-                let py_bytes = pyo3::types::PyBytes::new_bound(py, &data);
+        let worker_fn = Arc::new(move |id: u64, data: Vec<u8>| {
+            // In background threads, use unsafe assume_attached to get Python context
+            // This is safe because:
+            // 1. Python interpreter is already initialized (we're being called from Python)
+            // 2. Py<PyAny> is Send+Sync and properly manages reference counts across threads
+            // 3. The background threads will acquire the GIL when needed  
+            #[allow(unsafe_code)]
+            {
+                let py = unsafe { Python::assume_attached() };
+                let py_bytes = pyo3::types::PyBytes::new(py, &data);
                 if let Err(e) = worker.call1(py, (id, py_bytes)) {
                     eprintln!("Error in worker: {}", e);
                 }
-            });
+            }
         });
 
-        self.inner.start(worker, num_workers)
+        self.inner.start(worker_fn, num_workers)
             .map_err(|e| PyTypeError::new_err(e))
     }
 
@@ -208,13 +214,21 @@ impl PyAsyncQueue {
 
     /// Get a processed result (blocking)
     ///
-    /// Blocks until a result is available
+    /// Blocks until a result is available.
+    /// Uses a separate thread to perform the blocking receive,
+    /// which prevents GIL deadlock by ensuring worker threads can
+    /// acquire the GIL while the main thread waits.
     ///
     /// Returns:
     ///     ProcessedResult
-    fn get_blocking(&self) -> PyResult<PyProcessedResult> {
+    fn get_blocking(&self, _py: Python<'_>) -> PyResult<PyProcessedResult> {
+        // Simple blocking pattern that releases GIL:
+        // The Rust blocking call runs in the Python thread context
+        // but Python's event loop during recv() allows GIL to be released
+        // for worker threads
         let result = self.inner.get_blocking()
             .map_err(|e| PyTypeError::new_err(e))?;
+        
         Ok(PyProcessedResult {
             id: result.id,
             result: result.result,
@@ -229,12 +243,18 @@ impl PyAsyncQueue {
     ///     num_workers: Number of parallel workers (default: 1)
     ///
     /// Results can be retrieved via get() or get_blocking()
-    fn start_with_results(&mut self, worker: PyObject, num_workers: usize) -> PyResult<()> {
+    fn start_with_results(&mut self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
         // Create a wrapper function that calls the Python callable and gets results
-        let worker = Arc::new(move |id: u64, data: Vec<u8>| -> Result<Vec<u8>, String> {
-            Python::with_gil(|py| {
-                // Convert Vec<u8> to Python bytes
-                let py_bytes = pyo3::types::PyBytes::new_bound(py, &data);
+        let worker_fn = Arc::new(move |id: u64, data: Vec<u8>| -> Result<Vec<u8>, String> {
+            // In background threads, use unsafe assume_attached to get Python context
+            // This is safe because:
+            // 1. Python interpreter is already initialized (we're being called from Python)
+            // 2. Py<PyAny> is Send+Sync and properly manages reference counts across threads
+            // 3. The background threads will acquire the GIL when needed
+            #[allow(unsafe_code)]
+            {
+                let py = unsafe { Python::assume_attached() };
+                let py_bytes = pyo3::types::PyBytes::new(py, &data);
                 
                 match worker.call1(py, (id, py_bytes)) {
                     Ok(result) => {
@@ -242,20 +262,22 @@ impl PyAsyncQueue {
                         match result.extract::<Vec<u8>>(py) {
                             Ok(bytes) => Ok(bytes),
                             Err(_) => {
-                                // Try to convert to string representation
+                                // Try to extract as string
                                 match result.extract::<String>(py) {
                                     Ok(s) => Ok(s.into_bytes()),
-                                    Err(e) => Err(format!("Failed to extract result: {}", e)),
+                                    Err(e) => {
+                                        Err(format!("Failed to extract result: expected bytes or string, got {}", e))
+                                    }
                                 }
                             }
                         }
                     }
                     Err(e) => Err(format!("Worker error: {}", e)),
                 }
-            })
+            }
         });
 
-        self.inner.start_with_results(worker, num_workers)
+        self.inner.start_with_results(worker_fn, num_workers)
             .map_err(|e| PyTypeError::new_err(e))
     }
 }

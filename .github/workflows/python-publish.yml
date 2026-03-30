@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Clean old builds
         run: |
-          rm -rf target dist
+          rm -rf target dist build *.egg-info
         shell: bash
       - uses: actions/setup-python@v5
         with:
