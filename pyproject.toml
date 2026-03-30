@@ -3,16 +3,18 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "rst_queue"
-version = "0.1.0"
+name = "rst-queue"
+version = "0.1.1"
 description = "High-performance async queue system built with Rust and Crossbeam"
 requires-python = ">=3.8"
 license = { text = "MIT" }
+license-files = ["LICENSE"]
 authors = [
     { name = "Suraj Kalbande", email = "suraj202923@gmail.com" },
 ]
 readme = "README.md"
 keywords = ["queue", "async", "crossbeam", "concurrent"]
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -22,11 +24,15 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Rust",
     "Topic :: Software Development :: Libraries",
     "Topic :: System :: Operating System Kernels",
 ]
-repository = "https://github.com/suraj202923/rst_queue"
+
+[project.urls]
+Homepage = "https://github.com/suraj202923/rst_queue"
+Repository = "https://github.com/suraj202923/rst_queue"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "maturin>=1.0"]
