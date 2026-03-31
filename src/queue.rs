@@ -335,6 +335,7 @@ impl AsyncQueue {
                 loop {
                     match item_queue.pop() {
                         None => {
+                            // No items, sleep briefly
                             std::thread::sleep(std::time::Duration::from_micros(100));
                             continue;
                         }
