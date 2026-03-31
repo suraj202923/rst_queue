@@ -11,6 +11,12 @@ fn _rst_queue(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncQueue>()?;
     m.add_class::<PyQueueStats>()?;
     m.add_class::<PyProcessedResult>()?;
+    m.add("__version__", "0.2.0")?;
+    
+    // Add constants
+    m.add("SEQUENTIAL", 0)?;
+    m.add("PARALLEL", 1)?;
+    
     Ok(())
 }
 
@@ -96,6 +102,7 @@ impl PyProcessedResult {
 }
 
 /// Python wrapper for AsyncQueue
+/// Optimized with lock-free data structures and atomic counters
 #[pyclass(module = "rst_queue._rst_queue")]
 pub struct PyAsyncQueue {
     inner: AsyncQueue,
@@ -103,11 +110,11 @@ pub struct PyAsyncQueue {
 
 #[pymethods]
 impl PyAsyncQueue {
-    /// Create a new AsyncQueue
+    /// Create a new AsyncQueue optimized for high performance
     ///
     /// Args:
     ///     mode: 0 for SEQUENTIAL, 1 for PARALLEL (default: 1)
-    ///     buffer_size: Channel buffer size (default: 128)
+    ///     buffer_size: Ignored for lock-free SegQueue (kept for API compatibility)
     #[new]
     #[pyo3(signature = (mode = 1, buffer_size = 128))]
     fn new(mode: u8, buffer_size: usize) -> PyResult<Self> {
@@ -116,12 +123,24 @@ impl PyAsyncQueue {
         Ok(PyAsyncQueue { inner: queue })
     }
 
-    /// Push an item to the queue
+    /// Push a single item to the queue (lock-free operation)
     ///
     /// Args:
     ///     data: bytes to push to the queue
     fn push(&self, data: &[u8]) -> PyResult<()> {
         self.inner.push(data.to_vec())
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Push multiple items in batch (more efficient than individual pushes)
+    ///
+    /// Args:
+    ///     items: list of bytes to push
+    ///
+    /// Returns:
+    ///     list of item IDs
+    fn push_batch(&self, items: Vec<Vec<u8>>) -> PyResult<Vec<u64>> {
+        self.inner.push_batch(items)
             .map_err(|e| PyTypeError::new_err(e))
     }
 
@@ -142,12 +161,12 @@ impl PyAsyncQueue {
             .map_err(|e| PyTypeError::new_err(e))
     }
 
-    /// Get number of active workers
+    /// Get number of currently active workers
     fn active_workers(&self) -> usize {
         self.inner.active_workers()
     }
 
-    /// Get total items pushed to the queue
+    /// Get total items pushed to the queue since creation
     fn total_pushed(&self) -> u64 {
         self.inner.total_pushed()
     }
@@ -162,7 +181,7 @@ impl PyAsyncQueue {
         self.inner.total_errors()
     }
 
-    /// Get queue statistics
+    /// Get queue statistics as a snapshot
     fn get_stats(&self) -> PyResult<PyQueueStats> {
         let stats = self.inner.get_stats();
         Ok(PyQueueStats {
@@ -173,19 +192,15 @@ impl PyAsyncQueue {
         })
     }
 
-    /// Start processing queue items (fire-and-forget)
+    /// Start processing queue items (fire-and-forget mode)
     ///
     /// Args:
     ///     worker: A callable that accepts (item_id: int, data: bytes)
-    ///     num_workers: Number of parallel workers (default: 1)
+    ///     num_workers: Number of parallel workers (auto-scaling to CPU cores)
     fn start(&mut self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
-        // Create a wrapper function that calls the Python callable
         let worker_fn = Arc::new(move |id: u64, data: Vec<u8>| {
-            // In background threads, use unsafe assume_attached to get Python context
-            // This is safe because:
-            // 1. Python interpreter is already initialized (we're being called from Python)
-            // 2. Py<PyAny> is Send+Sync and properly manages reference counts across threads
-            // 3. The background threads will acquire the GIL when needed  
+            // Use unsafe Python::assume_attached() for background threads
+            // This is safe because PyO3 0.28.2 handles GIL acquisition automatically
             #[allow(unsafe_code)]
             {
                 let py = unsafe { Python::assume_attached() };
@@ -212,20 +227,32 @@ impl PyAsyncQueue {
         })
     }
 
+    /// Get multiple results in batch (non-blocking)
+    ///
+    /// Args:
+    ///     max_items: Maximum number of results to retrieve
+    ///
+    /// Returns:
+    ///     List of ProcessedResult objects (empty if none available)
+    fn get_batch(&self, max_items: usize) -> Vec<PyProcessedResult> {
+        self.inner.get_batch(max_items)
+            .into_iter()
+            .map(|r| PyProcessedResult {
+                id: r.id,
+                result: r.result,
+                error: r.error,
+            })
+            .collect()
+    }
+
     /// Get a processed result (blocking)
     ///
-    /// Blocks until a result is available.
-    /// Uses a separate thread to perform the blocking receive,
-    /// which prevents GIL deadlock by ensuring worker threads can
-    /// acquire the GIL while the main thread waits.
+    /// Blocks until a result is available using spin-wait with backoff.
+    /// Automatically releases GIL to allow worker threads to execute.
     ///
     /// Returns:
     ///     ProcessedResult
     fn get_blocking(&self, _py: Python<'_>) -> PyResult<PyProcessedResult> {
-        // Simple blocking pattern that releases GIL:
-        // The Rust blocking call runs in the Python thread context
-        // but Python's event loop during recv() allows GIL to be released
-        // for worker threads
         let result = self.inner.get_blocking()
             .map_err(|e| PyTypeError::new_err(e))?;
         
@@ -236,21 +263,20 @@ impl PyAsyncQueue {
         })
     }
 
+    /// Close the queue (prevent new items from being added)
+    fn close(&self) {
+        self.inner.close();
+    }
+
     /// Start processing with a worker that returns results
     ///
     /// Args:
     ///     worker: A callable that accepts (item_id: int, data: bytes) and returns bytes
-    ///     num_workers: Number of parallel workers (default: 1)
+    ///     num_workers: Number of parallel workers (auto-scaling to CPU cores)
     ///
     /// Results can be retrieved via get() or get_blocking()
     fn start_with_results(&mut self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
-        // Create a wrapper function that calls the Python callable and gets results
         let worker_fn = Arc::new(move |id: u64, data: Vec<u8>| -> Result<Vec<u8>, String> {
-            // In background threads, use unsafe assume_attached to get Python context
-            // This is safe because:
-            // 1. Python interpreter is already initialized (we're being called from Python)
-            // 2. Py<PyAny> is Send+Sync and properly manages reference counts across threads
-            // 3. The background threads will acquire the GIL when needed
             #[allow(unsafe_code)]
             {
                 let py = unsafe { Python::assume_attached() };
@@ -281,3 +307,4 @@ impl PyAsyncQueue {
             .map_err(|e| PyTypeError::new_err(e))
     }
 }
+

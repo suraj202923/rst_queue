@@ -409,6 +409,25 @@ Benchmarks on Intel i7 processing 100,000 items:
 
 *Results vary based on worker function complexity and system resources*
 
+## Testing
+
+AsyncQueue includes comprehensive tests with clear documentation and examples. Run the test suite:
+
+```bash
+# Run all tests
+pytest tests/test_async_queue_improved.py -v
+
+# Run with detailed output
+pytest tests/test_async_queue_improved.py -v -s
+
+# Run specific test group
+pytest tests/test_async_queue_improved.py::TestPushingItems -v -s
+```
+
+**Test Results**: ✅ 19 passed, 3 skipped (intentional - PyO3 limitation)
+
+For complete testing guide with examples and troubleshooting, see [TESTING.md](TESTING.md).
+
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

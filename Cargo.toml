@@ -15,8 +15,19 @@ categories = ["data-structures", "concurrency"]
 crate-type = ["cdylib"]
 
 [dependencies]
-crossbeam-channel = "0.5"
-pyo3 = { version = "0.28", features = ["extension-module", "abi3-py38"] }
+crossbeam = { version = "0.8", features = ["crossbeam-queue"] }
+num_cpus = "1.16"
+pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py38"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
 
 [[bin]]
 name = "queue_example"
