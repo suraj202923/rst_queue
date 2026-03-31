@@ -199,15 +199,19 @@ impl PyAsyncQueue {
     ///     num_workers: Number of parallel workers (auto-scaling to CPU cores)
     fn start(&mut self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
         let worker_fn = Arc::new(move |id: u64, data: Vec<u8>| {
-            // Use unsafe Python::assume_attached() for background threads
-            // This is safe because PyO3 0.28.2 handles GIL acquisition automatically
-            #[allow(unsafe_code)]
-            {
-                let py = unsafe { Python::assume_attached() };
+            // Use try_attach to safely acquire GIL in background thread
+            if let Some(_) = pyo3::Python::try_attach(|py| {
                 let py_bytes = pyo3::types::PyBytes::new(py, &data);
-                if let Err(e) = worker.call1(py, (id, py_bytes)) {
-                    eprintln!("Error in worker: {}", e);
+                match worker.call1(py, (id, py_bytes)) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        eprintln!("[ERROR] Worker execution error for item {}: {}", id, e);
+                    }
                 }
+            }) {
+                // Successfully executed
+            } else {
+                eprintln!("[ERROR] Failed to acquire GIL for item {}", id);
             }
         });
 
@@ -277,9 +281,8 @@ impl PyAsyncQueue {
     /// Results can be retrieved via get() or get_blocking()
     fn start_with_results(&mut self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
         let worker_fn = Arc::new(move |id: u64, data: Vec<u8>| -> Result<Vec<u8>, String> {
-            #[allow(unsafe_code)]
-            {
-                let py = unsafe { Python::assume_attached() };
+            // Use try_attach to safely acquire GIL in background thread
+            pyo3::Python::try_attach(|py| {
                 let py_bytes = pyo3::types::PyBytes::new(py, &data);
                 
                 match worker.call1(py, (id, py_bytes)) {
@@ -298,9 +301,9 @@ impl PyAsyncQueue {
                             }
                         }
                     }
-                    Err(e) => Err(format!("Worker error: {}", e)),
+                    Err(e) => Err(format!("Worker execution error for item {}: {}", id, e)),
                 }
-            }
+            }).ok_or_else(|| "Failed to acquire GIL".to_string())?
         });
 
         self.inner.start_with_results(worker_fn, num_workers)
