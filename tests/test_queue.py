@@ -1507,5 +1507,401 @@ class TestClearAndPendingItems:
         print_test_result(True, "Batch-pushed items cleared successfully")
 
 
+# ============================================================================
+# GROUP 11: TOTAL_REMOVED COUNTER - NEW FEATURE
+# ============================================================================
+
+class TestTotalRemovedCounter:
+    """Test the new total_removed counter in queue statistics"""
+
+    def test_51_total_removed_field_exists(self):
+        """Test that total_removed field exists in stats"""
+        print_test_header(
+            "Total Removed - Field Existence",
+            "Verify that total_removed field is present in QueueStats"
+        )
+        
+        queue = AsyncQueue()
+        stats = queue.get_stats()
+        
+        logger.info("Checking for total_removed field...")
+        has_field = hasattr(stats, 'total_removed')
+        logger.info(f"  total_removed field: {has_field}")
+        
+        assert has_field, "Stats should have 'total_removed' field"
+        
+        print(f"    * total_removed field exists: {has_field}")
+        print(f"    * initial value: {stats.total_removed}")
+        
+        print_test_result(True, "total_removed field verified")
+
+    def test_52_total_removed_initial_value(self):
+        """Test that total_removed is initially 0"""
+        print_test_header(
+            "Total Removed - Initial State",
+            "Verify initial total_removed is 0"
+        )
+        
+        queue = AsyncQueue()
+        stats = queue.get_stats()
+        
+        logger.info(f"Initial total_removed: {stats.total_removed}")
+        
+        assert stats.total_removed == 0
+        
+        print(f"    * Initial total_removed: {stats.total_removed}")
+        print_test_result(True, "Initial total_removed is 0")
+
+    def test_53_total_removed_after_get(self):
+        """Test total_removed increments after get()"""
+        print_test_header(
+            "Total Removed - After get()",
+            "Verify total_removed increments when results are consumed"
+        )
+        
+        queue = AsyncQueue(mode=ExecutionMode.PARALLEL)
+        
+        def simple_worker(item_id, data):
+            return data.upper()
+        
+        logger.info("Starting workers...")
+        queue.start_with_results(simple_worker, num_workers=1)
+        
+        # Push items
+        logger.info("Pushing 5 items...")
+        for i in range(5):
+            queue.push(f"item{i}".encode())
+        
+        time.sleep(0.3)  # Wait for processing
+        
+        # Get results one by one
+        logger.info("Getting results with get()...")
+        removed_count = 0
+        for i in range(5):
+            result = queue.get()
+            if result:
+                removed_count += 1
+                logger.info(f"  Got result {result.id}")
+        
+        stats = queue.get_stats()
+        logger.info(f"Final stats: removed={stats.total_removed}, processed={stats.total_processed}")
+        
+        assert stats.total_removed == 5
+        
+        print(f"    * Items pushed: 5")
+        print(f"    * Items retrieved with get(): {removed_count}")
+        print(f"    * total_removed: {stats.total_removed}")
+        print(f"    * total_processed: {stats.total_processed}")
+        
+        print_test_result(True, f"get() incremented total_removed to {stats.total_removed}")
+
+    def test_54_total_removed_after_get_batch(self):
+        """Test total_removed increments after get_batch()"""
+        print_test_header(
+            "Total Removed - After get_batch()",
+            "Verify total_removed increments with batch consumption"
+        )
+        
+        queue = AsyncQueue(mode=ExecutionMode.PARALLEL)
+        
+        def batch_worker(item_id, data):
+            return data * 2
+        
+        logger.info("Starting workers...")
+        queue.start_with_results(batch_worker, num_workers=2)
+        
+        # Push 10 items
+        logger.info("Pushing 10 items...")
+        for i in range(10):
+            queue.push(f"data{i}".encode())
+        
+        time.sleep(0.4)  # Wait for processing
+        
+        # Get batch
+        logger.info("Getting batch of 5...")
+        batch1 = queue.get_batch(5)
+        logger.info(f"  Retrieved {len(batch1)} items")
+        
+        stats_after_batch1 = queue.get_stats()
+        logger.info(f"After first batch: total_removed={stats_after_batch1.total_removed}")
+        
+        assert stats_after_batch1.total_removed == 5
+        
+        # Get remaining
+        logger.info("Getting remaining items...")
+        batch2 = queue.get_batch(10)
+        logger.info(f"  Retrieved {len(batch2)} items")
+        
+        stats_after_batch2 = queue.get_stats()
+        logger.info(f"After second batch: total_removed={stats_after_batch2.total_removed}")
+        
+        assert stats_after_batch2.total_removed == 10
+        
+        print(f"    * Items pushed: 10")
+        print(f"    * First batch get_batch(5): {len(batch1)} items")
+        print(f"    * total_removed after batch1: {stats_after_batch1.total_removed}")
+        print(f"    * Second batch get_batch(10): {len(batch2)} items")
+        print(f"    * total_removed after batch2: {stats_after_batch2.total_removed}")
+        
+        print_test_result(True, f"get_batch() incremented total_removed to {stats_after_batch2.total_removed}")
+
+    def test_55_total_removed_after_get_blocking(self):
+        """Test total_removed increments after get_blocking()"""
+        print_test_header(
+            "Total Removed - After get_blocking()",
+            "Verify total_removed increments with blocking get"
+        )
+        
+        queue = AsyncQueue(mode=ExecutionMode.PARALLEL)
+        
+        def worker(item_id, data):
+            return b"result: " + data
+        
+        logger.info("Starting workers...")
+        queue.start_with_results(worker, num_workers=1)
+        
+        # Push 3 items
+        logger.info("Pushing 3 items...")
+        for i in range(3):
+            queue.push(f"item{i}".encode())
+        
+        time.sleep(0.2)  # Wait for processing
+        
+        # Get with blocking
+        logger.info("Getting result with get_blocking()...")
+        result = queue.get_blocking()
+        logger.info(f"  Got result: {result}")
+        
+        stats = queue.get_stats()
+        logger.info(f"After get_blocking: total_removed={stats.total_removed}")
+        
+        assert stats.total_removed == 1
+        
+        # Get more with get()
+        result2 = queue.get()
+        result3 = queue.get()
+        
+        stats_final = queue.get_stats()
+        logger.info(f"Final total_removed={stats_final.total_removed}")
+        
+        assert stats_final.total_removed == 3
+        
+        print(f"    * Items pushed: 3")
+        print(f"    * get_blocking() called once")
+        print(f"    * total_removed after get_blocking: {stats.total_removed}")
+        print(f"    * get() called twice more")
+        print(f"    * final total_removed: {stats_final.total_removed}")
+        
+        print_test_result(True, f"get_blocking() incremented total_removed to {stats_final.total_removed}")
+
+    def test_56_total_removed_partial_consumption(self):
+        """Test total_removed with partial consumption"""
+        print_test_header(
+            "Total Removed - Partial Consumption",
+            "Verify total_removed reflects only consumed items"
+        )
+        
+        queue = AsyncQueue(mode=ExecutionMode.PARALLEL)
+        
+        def worker(item_id, data):
+            return data.upper()
+        
+        logger.info("Starting workers...")
+        queue.start_with_results(worker, num_workers=1)
+        
+        # Push 10 items
+        logger.info("Pushing 10 items...")
+        for i in range(10):
+            queue.push(f"item{i}".encode())
+        
+        time.sleep(0.5)  # Wait for all to be processed
+        
+        # Consume only 3 items
+        logger.info("Consuming only 3 out of 10...")
+        for i in range(3):
+            queue.get()
+        
+        stats = queue.get_stats()
+        logger.info(f"Stats after partial consumption: total_removed={stats.total_removed}")
+        
+        assert stats.total_removed == 3
+        assert stats.total_processed == 10  # All processed
+        
+        print(f"    * Items pushed: 10")
+        print(f"    * Items processed: {stats.total_processed}")
+        print(f"    * Items consumed (removed): {stats.total_removed}")
+        
+        print_test_result(True, f"total_removed correctly shows {stats.total_removed} consumed, {stats.total_processed} processed")
+
+    def test_57_total_removed_multiple_batches(self):
+        """Test total_removed across multiple batch operations"""
+        print_test_header(
+            "Total Removed - Multiple Batches",
+            "Verify total_removed accumulates across multiple get_batch calls"
+        )
+        
+        queue = AsyncQueue(mode=ExecutionMode.PARALLEL)
+        
+        def worker(item_id, data):
+            return data
+        
+        logger.info("Starting workers...")
+        queue.start_with_results(worker, num_workers=2)
+        
+        # Push 100 items
+        logger.info("Pushing 100 items...")
+        for i in range(100):
+            queue.push(f"item{i}".encode())
+        
+        time.sleep(0.8)  # Wait for all to be processed
+        
+        # Consume in batches
+        logger.info("Consuming in batches of 10, 20, 30...")
+        batch_sizes = [10, 20, 30, 40]
+        total_consumed = 0
+        
+        for batch_size in batch_sizes:
+            batch = queue.get_batch(batch_size)
+            consumed = len(batch)
+            total_consumed += consumed
+            stats = queue.get_stats()
+            logger.info(f"  Batch of {batch_size}: got {consumed}, total_removed={stats.total_removed}")
+            print(f"    * get_batch({batch_size}): got {consumed} items, cumulative total_removed={stats.total_removed}")
+        
+        stats_final = queue.get_stats()
+        logger.info(f"Final: total_removed={stats_final.total_removed}, total_consumed={total_consumed}")
+        
+        assert stats_final.total_removed == total_consumed
+        
+        print(f"    * Total items pushed: 100")
+        print(f"    * Total items consumed: {total_consumed}")
+        print(f"    * final total_removed: {stats_final.total_removed}")
+        
+        print_test_result(True, f"total_removed correctly accumulated to {stats_final.total_removed}")
+
+    def test_58_total_removed_versus_processed(self):
+        """Test relationship between total_removed and total_processed"""
+        print_test_header(
+            "Total Removed - vs Total Processed",
+            "Verify total_removed <= total_processed relationship"
+        )
+        
+        queue = AsyncQueue(mode=ExecutionMode.PARALLEL)
+        
+        def worker(item_id, data):
+            return data
+        
+        logger.info("Starting workers...")
+        queue.start_with_results(worker, num_workers=2)
+        
+        # Push 20 items
+        logger.info("Pushing 20 items...")
+        for i in range(20):
+            queue.push(f"item{i}".encode())
+        
+        time.sleep(0.5)  # Wait for processing
+        
+        # Consume only 15
+        logger.info("Consuming 15 out of 20...")
+        for _ in range(15):
+            queue.get()
+        
+        stats = queue.get_stats()
+        logger.info(f"Stats: total_removed={stats.total_removed}, total_processed={stats.total_processed}")
+        
+        # total_removed should be <= total_processed
+        assert stats.total_removed <= stats.total_processed
+        assert stats.total_processed >= stats.total_removed
+        
+        print(f"    * total_processed: {stats.total_processed}")
+        print(f"    * total_removed: {stats.total_removed}")
+        print(f"    * Relationship (removed ≤ processed): {stats.total_removed} ≤ {stats.total_processed} ✓")
+        
+        print_test_result(True, f"Relationship verified: total_removed({stats.total_removed}) ≤ total_processed({stats.total_processed})")
+
+    def test_59_total_removed_all_consumed(self):
+        """Test total_removed when all processed items are consumed"""
+        print_test_header(
+            "Total Removed - All Consumed",
+            "Verify total_removed == total_processed when all consumed"
+        )
+        
+        queue = AsyncQueue(mode=ExecutionMode.PARALLEL)
+        
+        def worker(item_id, data):
+            return data.lower()
+        
+        logger.info("Starting workers...")
+        queue.start_with_results(worker, num_workers=2)
+        
+        # Push and consume all
+        num_items = 25
+        logger.info(f"Pushing and consuming {num_items} items...")
+        
+        for i in range(num_items):
+            queue.push(f"ITEM{i}".encode())
+        
+        time.sleep(0.5)  # Wait for processing
+        
+        # Consume all
+        count = 0
+        while True:
+            result = queue.get()
+            if result is None:
+                break
+            count += 1
+        
+        stats = queue.get_stats()
+        logger.info(f"Final stats: pushed={stats.total_pushed}, processed={stats.total_processed}, removed={stats.total_removed}")
+        
+        assert stats.total_removed == stats.total_processed
+        
+        print(f"    * Items pushed: {stats.total_pushed}")
+        print(f"    * Items processed: {stats.total_processed}")
+        print(f"    * Items consumed: {stats.total_removed}")
+        print(f"    * Equality check (removed == processed): {stats.total_removed} == {stats.total_processed} ✓")
+        
+        print_test_result(True, f"All items consumed: total_removed({stats.total_removed}) == total_processed({stats.total_processed})")
+
+    def test_60_total_removed_stats_repr(self):
+        """Test that total_removed appears in stats repr"""
+        print_test_header(
+            "Total Removed - Stats Representation",
+            "Verify total_removed is displayed in stats string"
+        )
+        
+        queue = AsyncQueue(mode=ExecutionMode.PARALLEL)
+        
+        def worker(item_id, data):
+            return data
+        
+        queue.start_with_results(worker, num_workers=1)
+        
+        # Push and consume some items
+        logger.info("Pushing and consuming items...")
+        for i in range(5):
+            queue.push(f"item{i}".encode())
+        
+        time.sleep(0.3)
+        
+        # Consume 3 items
+        for _ in range(3):
+            queue.get()
+        
+        stats = queue.get_stats()
+        stats_repr = repr(stats)
+        
+        logger.info(f"Stats repr: {stats_repr}")
+        
+        # Check that total_removed is in the representation
+        assert 'total_removed' in stats_repr.lower()
+        
+        print(f"    * Stats representation:")
+        print(f"      {stats_repr}")
+        print(f"    * Contains 'total_removed': {'total_removed' in stats_repr.lower()}")
+        
+        print_test_result(True, "total_removed is visible in stats representation")
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
