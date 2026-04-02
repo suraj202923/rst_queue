@@ -26,6 +26,7 @@ pub struct PyQueueStats {
     pub total_pushed: u64,
     pub total_processed: u64,
     pub total_errors: u64,
+    pub total_removed: u64,
     pub active_workers: usize,
 }
 
@@ -47,14 +48,19 @@ impl PyQueueStats {
     }
 
     #[getter]
+    fn total_removed(&self) -> u64 {
+        self.total_removed
+    }
+
+    #[getter]
     fn active_workers(&self) -> usize {
         self.active_workers
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "QueueStats(total_pushed={}, total_processed={}, total_errors={}, active_workers={})",
-            self.total_pushed, self.total_processed, self.total_errors, self.active_workers
+            "QueueStats(total_pushed={}, total_processed={}, total_errors={}, total_removed={}, active_workers={})",
+            self.total_pushed, self.total_processed, self.total_errors, self.total_removed, self.active_workers
         )
     }
 }
@@ -188,6 +194,7 @@ impl PyAsyncQueue {
             total_pushed: stats.total_pushed,
             total_processed: stats.total_processed,
             total_errors: stats.total_errors,
+            total_removed: stats.total_removed,
             active_workers: stats.active_workers,
         })
     }

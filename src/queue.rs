@@ -56,6 +56,7 @@ pub struct QueueStats {
     pub total_pushed: u64,
     pub total_processed: u64,
     pub total_errors: u64,
+    pub total_removed: u64,
     pub active_workers: usize,
 }
 
@@ -72,6 +73,7 @@ pub struct AsyncQueue {
     active_workers: Arc<AtomicUsize>,
     processed_count: Arc<AtomicU64>,
     error_count: Arc<AtomicU64>,
+    removed_count: Arc<AtomicU64>,
     
     /// Execution mode
     mode: Arc<Mutex<ExecutionMode>>,
@@ -109,6 +111,7 @@ impl AsyncQueue {
             active_workers: Arc::new(AtomicUsize::new(0)),
             processed_count: Arc::new(AtomicU64::new(0)),
             error_count: Arc::new(AtomicU64::new(0)),
+            removed_count: Arc::new(AtomicU64::new(0)),
             mode: Arc::new(Mutex::new(execution_mode)),
             is_closed: Arc::new(AtomicUsize::new(0)),
         })
@@ -172,19 +175,31 @@ impl AsyncQueue {
         self.error_count.load(Ordering::Acquire)
     }
 
+    /// Get total results removed from the queue
+    pub fn total_removed(&self) -> u64 {
+        self.removed_count.load(Ordering::Acquire)
+    }
+
     /// Get queue statistics (lock-free read)
     pub fn get_stats(&self) -> QueueStats {
         QueueStats {
             total_pushed: self.total_pushed(),
             total_processed: self.total_processed(),
             total_errors: self.total_errors(),
+            total_removed: self.total_removed(),
             active_workers: self.active_workers(),
         }
     }
 
     /// Get a processed result from the result queue (non-blocking)
     pub fn get(&self) -> Option<ProcessedResult> {
-        self.result_queue.pop()
+        match self.result_queue.pop() {
+            Some(result) => {
+                self.removed_count.fetch_add(1, Ordering::AcqRel);
+                Some(result)
+            }
+            None => None,
+        }
     }
 
     /// Get multiple results in batch (non-blocking)
@@ -192,7 +207,10 @@ impl AsyncQueue {
         let mut results = Vec::with_capacity(max_items);
         for _ in 0..max_items {
             match self.result_queue.pop() {
-                Some(result) => results.push(result),
+                Some(result) => {
+                    self.removed_count.fetch_add(1, Ordering::AcqRel);
+                    results.push(result);
+                }
                 None => break,
             }
         }
@@ -204,6 +222,7 @@ impl AsyncQueue {
         let mut backoff = crossbeam::utils::Backoff::new();
         loop {
             if let Some(result) = self.result_queue.pop() {
+                self.removed_count.fetch_add(1, Ordering::AcqRel);
                 return Ok(result);
             }
             backoff.snooze();
