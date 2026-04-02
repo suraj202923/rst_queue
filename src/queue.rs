@@ -215,6 +215,38 @@ impl AsyncQueue {
         self.is_closed.store(1, Ordering::Release);
     }
 
+    /// Clear all pending items from the queue
+    /// Returns the number of items removed
+    /// Only affects items not yet being processed
+    pub fn clear(&self) -> usize {
+        let mut count = 0;
+        while self.item_queue.pop().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    /// Get the number of pending items in the queue (non-blocking estimate)
+    /// This is a best-effort estimate and not guaranteed to be exact
+    /// due to concurrent operations
+    pub fn pending_items(&self) -> usize {
+        let mut count = 0;
+        let mut temp_items = Vec::new();
+        
+        // Pop all items and count them
+        while let Some(item) = self.item_queue.pop() {
+            temp_items.push(item);
+            count += 1;
+        }
+        
+        // Push them back to preserve queue
+        for item in temp_items {
+            self.item_queue.push(item);
+        }
+        
+        count
+    }
+
     /// Start the queue with a worker function that returns results
     pub fn start_with_results(&mut self, worker: ResultWorkerFn, num_workers: usize) -> Result<(), String> {
         let mode = self.mode.lock().unwrap().clone();

@@ -1147,5 +1147,365 @@ class TestQuickReferenceExamples:
         print_test_result(True, "See example above")
 
 
+# ============================================================================
+# GROUP 10: NEW METHODS - CLEAR AND PENDING_ITEMS
+# ============================================================================
+
+class TestClearAndPendingItems:
+    """Test new methods: clear() and pending_items()"""
+
+    def test_40_clear_empty_queue(self):
+        """Test clearing an empty queue"""
+        print_test_header(
+            "Clear - Empty Queue",
+            "Verify that clearing an empty queue returns 0"
+        )
+        
+        queue = AsyncQueue()
+        
+        logger.info("Clearing empty queue...")
+        removed = queue.clear()
+        
+        logger.info(f"Items removed: {removed}")
+        
+        assert removed == 0
+        assert queue.total_pushed() == 0
+        
+        print(f"    * Items removed: {removed}")
+        print(f"    * total_pushed: {queue.total_pushed()}")
+        
+        print_test_result(True, "Empty queue cleared (0 items removed)")
+
+    def test_41_clear_queue_with_items(self):
+        """Test clearing queue with pending items"""
+        print_test_header(
+            "Clear - Queue with Items",
+            "Verify that clear removes all pending items"
+        )
+        
+        queue = AsyncQueue()
+        num_items = 50
+        
+        logger.info(f"Pushing {num_items} items...")
+        for i in range(num_items):
+            queue.push(f"item_{i}".encode())
+        
+        assert queue.total_pushed() == num_items
+        logger.info(f"Pending items before clear: {queue.pending_items()}")
+        
+        logger.info("Clearing queue...")
+        removed = queue.clear()
+        
+        logger.info(f"Items removed: {removed}")
+        assert removed == num_items
+        
+        pending_after = queue.pending_items()
+        logger.info(f"Pending items after clear: {pending_after}")
+        assert pending_after == 0
+        
+        print(f"    * Items pushed: {num_items}")
+        print(f"    * Items removed: {removed}")
+        print(f"    * Pending after: {pending_after}")
+        print(f"    * total_pushed (unchanged): {queue.total_pushed()}")
+        
+        print_test_result(True, f"Queue cleared successfully ({removed} items removed)")
+
+    def test_42_clear_large_batch(self):
+        """Test clearing a large batch of items"""
+        print_test_header(
+            "Clear - Large Batch",
+            "Verify that clear handles large batches efficiently"
+        )
+        
+        queue = AsyncQueue()
+        num_items = 10000
+        
+        logger.info(f"Pushing {num_items} items...")
+        for i in range(num_items):
+            queue.push(f"item_{i}".encode())
+        
+        logger.info("Clearing large batch...")
+        start_time = time.time()
+        removed = queue.clear()
+        elapsed = time.time() - start_time
+        
+        logger.info(f"Items removed: {removed} in {elapsed:.4f} seconds")
+        
+        assert removed == num_items
+        assert queue.pending_items() == 0
+        
+        throughput = num_items / elapsed if elapsed > 0 else float('inf')
+        
+        print(f"    * Items cleared: {removed:,}")
+        print(f"    * Time taken: {elapsed:.4f} seconds")
+        print(f"    * Throughput: {throughput:,.0f} items/sec")
+        
+        print_test_result(True, f"Large batch cleared ({removed:,} items)")
+
+    def test_43_clear_preserves_stats(self):
+        """Test that clear doesn't affect statistics counters"""
+        print_test_header(
+            "Clear - Statistics Preservation",
+            "Verify that clear doesn't modify queue statistics"
+        )
+        
+        queue = AsyncQueue()
+        num_items = 100
+        
+        logger.info(f"Pushing {num_items} items...")
+        for i in range(num_items):
+            queue.push(f"item_{i}".encode())
+        
+        stats_before = queue.get_stats()
+        logger.info(f"Stats before clear: pushed={stats_before.total_pushed}")
+        
+        logger.info("Clearing queue...")
+        removed = queue.clear()
+        
+        stats_after = queue.get_stats()
+        logger.info(f"Stats after clear: pushed={stats_after.total_pushed}")
+        
+        assert stats_before.total_pushed == stats_after.total_pushed
+        assert stats_before.total_processed == stats_after.total_processed
+        assert stats_before.total_errors == stats_after.total_errors
+        
+        print(f"    * Removed: {removed} items")
+        print(f"    * total_pushed: {stats_before.total_pushed} (unchanged)")
+        print(f"    * total_processed: {stats_before.total_processed} (unchanged)")
+        print(f"    * total_errors: {stats_before.total_errors} (unchanged)")
+        
+        print_test_result(True, "Statistics preserved after clear")
+
+    def test_44_clear_while_processing(self):
+        """Test clearing while workers are processing"""
+        print_test_header(
+            "Clear - During Processing",
+            "Verify that clear doesn't affect items being processed"
+        )
+        
+        queue = AsyncQueue()
+        processed = []
+        lock = threading.Lock()
+        
+        def worker(item_id, data):
+            time.sleep(0.01)  # Simulate work
+            with lock:
+                processed.append(item_id)
+        
+        logger.info("Pushing 20 items and starting workers...")
+        for i in range(20):
+            queue.push(f"item_{i}".encode())
+        
+        queue.start(worker, num_workers=2)
+        
+        # Let some items get picked up
+        time.sleep(0.02)
+        
+        # Now clear remaining
+        logger.info("Clearing remaining items...")
+        removed = queue.clear()
+        logger.info(f"Items cleared: {removed}")
+        
+        # Wait for workers to finish
+        time.sleep(0.3)
+        
+        total_accounted = len(processed) + removed
+        logger.info(f"Items processed: {len(processed)}, cleared: {removed}, total: {total_accounted}")
+        
+        assert total_accounted == 20
+        
+        print(f"    * Items processed by workers: {len(processed)}")
+        print(f"    * Items cleared: {removed}")
+        print(f"    * Total accounted: {total_accounted} (expected 20)")
+        
+        print_test_result(True, "Clear during processing successful (no worker impact)")
+
+    def test_45_pending_items_empty_queue(self):
+        """Test pending_items on empty queue"""
+        print_test_header(
+            "pending_items - Empty Queue",
+            "Verify that pending_items returns 0 for empty queue"
+        )
+        
+        queue = AsyncQueue()
+        
+        logger.info("Checking pending items on empty queue...")
+        pending = queue.pending_items()
+        
+        logger.info(f"Pending items: {pending}")
+        
+        assert pending == 0
+        
+        print(f"    * Pending items: {pending}")
+        
+        print_test_result(True, "pending_items correctly returns 0 for empty queue")
+
+    def test_46_pending_items_with_items(self):
+        """Test pending_items returns correct count"""
+        print_test_header(
+            "pending_items - With Items",
+            "Verify that pending_items returns accurate count"
+        )
+        
+        queue = AsyncQueue()
+        
+        for count in [1, 5, 10, 50]:
+            logger.info(f"Pushing {count} items...")
+            queue.clear()  # Clear from previous iteration
+            
+            for i in range(count):
+                queue.push(f"item_{i}".encode())
+            
+            pending = queue.pending_items()
+            logger.info(f"Pending items: {pending}")
+            
+            assert pending == count
+            print(f"    * Pushed: {count}, Pending: {pending}")
+        
+        print_test_result(True, "pending_items returns correct counts")
+
+    def test_47_pending_items_after_clear(self):
+        """Test pending_items after clearing"""
+        print_test_header(
+            "pending_items - After Clear",
+            "Verify that pending_items returns 0 after clear"
+        )
+        
+        queue = AsyncQueue()
+        num_items = 50
+        
+        logger.info(f"Pushing {num_items} items...")
+        for i in range(num_items):
+            queue.push(f"item_{i}".encode())
+        
+        logger.info(f"Pending before clear: {queue.pending_items()}")
+        assert queue.pending_items() == num_items
+        
+        logger.info("Clearing queue...")
+        queue.clear()
+        
+        logger.info("Checking pending after clear...")
+        pending_after = queue.pending_items()
+        logger.info(f"Pending after clear: {pending_after}")
+        
+        assert pending_after == 0
+        
+        print(f"    * Items before clear: {num_items}")
+        print(f"    * Items after clear: {pending_after}")
+        
+        print_test_result(True, "pending_items returns 0 after clear")
+
+    def test_48_clear_and_pending_concurrent(self):
+        """Test clear and pending_items under concurrent access"""
+        print_test_header(
+            "Clear & pending_items - Concurrent",
+            "Verify thread safety of both operations"
+        )
+        
+        queue = AsyncQueue()
+        errors = []
+        
+        def pusher():
+            try:
+                for _ in range(100):
+                    queue.push(b"data")
+            except Exception as e:
+                errors.append(f"Pusher error: {e}")
+        
+        def meter():
+            try:
+                for _ in range(50):
+                    pending = queue.pending_items()
+                    time.sleep(0.001)
+            except Exception as e:
+                errors.append(f"Meter error: {e}")
+        
+        def clearer():
+            try:
+                time.sleep(0.05)
+                removed = queue.clear()
+                logger.info(f"Removed: {removed}")
+            except Exception as e:
+                errors.append(f"Clearer error: {e}")
+        
+        logger.info("Starting concurrent pusher, meter, and clearer...")
+        threads = [
+            threading.Thread(target=pusher),
+            threading.Thread(target=pusher),
+            threading.Thread(target=meter),
+            threading.Thread(target=clearer),
+        ]
+        
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        
+        assert len(errors) == 0, f"Concurrent errors: {errors}"
+        
+        print(f"    * No concurrent errors")
+        print(f"    * final_pending: {queue.pending_items()}")
+        
+        print_test_result(True, "Concurrent clear and pending_items operations successful")
+
+    def test_49_multiple_clears(self):
+        """Test multiple clear operations in sequence"""
+        print_test_header(
+            "Multiple Clears",
+            "Verify that multiple clears work correctly"
+        )
+        
+        queue = AsyncQueue()
+        
+        for iteration in range(3):
+            logger.info(f"Iteration {iteration+1}:")
+            
+            # Push items
+            for i in range(20):
+                queue.push(f"iter_{iteration}_item_{i}".encode())
+            
+            pending = queue.pending_items()
+            logger.info(f"  Pending: {pending}")
+            print(f"    * Iteration {iteration+1}:  Pending={pending}", end="")
+            
+            # Clear
+            removed = queue.clear()
+            logger.info(f"  Removed: {removed}")
+            print(f"  → Removed={removed}")
+            
+            assert pending == 20
+            assert removed == 20
+            assert queue.pending_items() == 0
+        
+        print_test_result(True, "Multiple clears executed successfully")
+
+    def test_50_clear_batch_push(self):
+        """Test clear after batch push"""
+        print_test_header(
+            "Clear - After Batch Push",
+            "Verify that clear works with batch-pushed items"
+        )
+        
+        queue = AsyncQueue()
+        
+        # Batch push
+        items = [f"item_{i}".encode() for i in range(100)]
+        logger.info("Batch pushing 100 items...")
+        ids = queue.push_batch(items)
+        assert len(ids) == 100
+        
+        logger.info("Clearing batch...")
+        removed = queue.clear()
+        logger.info(f"Items removed: {removed}")
+        
+        assert removed == 100
+        assert queue.pending_items() == 0
+        
+        print(f"    * Batch pushed: 100 items")
+        print(f"    * Batch cleared: {removed} items")
+        
+        print_test_result(True, "Batch-pushed items cleared successfully")
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])

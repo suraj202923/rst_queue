@@ -272,6 +272,22 @@ impl PyAsyncQueue {
         self.inner.close();
     }
 
+    /// Clear all pending items from the queue
+    ///
+    /// Returns the number of items removed. Only removes items that haven't
+    /// been picked up by workers yet. Already-processing items are unaffected.
+    fn clear(&self) -> usize {
+        self.inner.clear()
+    }
+
+    /// Get the number of pending items waiting in the queue
+    ///
+    /// Returns an estimate of pending items. This is non-blocking but may not be
+    /// 100% accurate due to concurrent operations.
+    fn pending_items(&self) -> usize {
+        self.inner.pending_items()
+    }
+
     /// Start processing with a worker that returns results
     ///
     /// Args:
