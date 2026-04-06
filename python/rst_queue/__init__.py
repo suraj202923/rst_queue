@@ -39,12 +39,14 @@ from enum import IntEnum
 try:
     from rst_queue._rst_queue import (
         PyAsyncQueue,
+        PyAsyncPersistenceQueue,
         PyQueueStats,
         PyProcessedResult,
     )
     
     # Export with friendly names
     AsyncQueue = PyAsyncQueue
+    AsyncPersistenceQueue = PyAsyncPersistenceQueue
     QueueStats = PyQueueStats
     ProcessedResult = PyProcessedResult
     _use_rust = True
