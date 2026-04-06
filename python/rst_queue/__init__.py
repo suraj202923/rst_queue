@@ -28,7 +28,7 @@ Quick Usage:
     print(f"Result: {result.result}")
 """
 
-__version__ = "0.2.0"
+__version__ = "0.1.8"
 __author__ = "Suraj Kalbande"
 __email__ = "suraj202923@gmail.com"
 __license__ = "MIT"

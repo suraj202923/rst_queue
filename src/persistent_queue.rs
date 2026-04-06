@@ -18,8 +18,6 @@ enum IoOperation {
     PersistCounter { counter_val: u64 },
     /// Flush Write-Ahead Log to Sled (Phase 3)
     FlushWal { wal: Vec<(Vec<u8>, Vec<u8>)> },
-    /// Flush all pending writes to disk
-    Flush,
     /// Shutdown signal
     Shutdown,
 }
@@ -29,6 +27,7 @@ enum IoOperation {
 /// Uses Sled to store encoded data, in-memory processing
 /// Phase 2: Async I/O thread pool for non-blocking persistence
 /// Phase 3: Write-Ahead Log (WAL) for batched persistence
+#[allow(dead_code)]
 pub struct AsyncPersistenceQueue {
     /// Lock-free queue for items (in-memory)
     item_queue: Arc<SegQueue<QueueItem>>,
@@ -105,20 +104,6 @@ impl AsyncPersistenceQueue {
                         counter_val = None;
                     }
                     // Single flush for entire WAL batch
-                    let _ = db.flush();
-                    last_flush = Instant::now();
-                }
-                Ok(IoOperation::Flush) => {
-                    // Write all pending items to Sled
-                    for (key, value) in pending.drain(..) {
-                        let _ = db.insert(&key, value);
-                    }
-                    // Persist counter metadata if updated
-                    if let Some(val) = counter_val {
-                        let _ = db.insert(b"meta:counter", val.to_le_bytes().to_vec());
-                        counter_val = None;
-                    }
-                    // Single flush for entire batch
                     let _ = db.flush();
                     last_flush = Instant::now();
                 }
@@ -279,6 +264,8 @@ impl AsyncPersistenceQueue {
     }
 
     /// Persist counter to disk
+    /// Persist counter to disk
+    #[allow(dead_code)]
     fn persist_counter(&self) -> Result<(), String> {
         let counter_val = self.counter.load(Ordering::Acquire);
         self.db.insert(b"meta:counter", counter_val.to_le_bytes().to_vec())
@@ -289,6 +276,7 @@ impl AsyncPersistenceQueue {
     }
 
     /// Persist processed count to disk
+    #[allow(dead_code)]
     fn persist_processed(&self) -> Result<(), String> {
         let processed_val = self.processed_count.load(Ordering::Acquire);
         self.db.insert(b"meta:processed", processed_val.to_le_bytes().to_vec())
@@ -297,6 +285,7 @@ impl AsyncPersistenceQueue {
     }
 
     /// Persist error count to disk
+    #[allow(dead_code)]
     fn persist_errors(&self) -> Result<(), String> {
         let error_val = self.error_count.load(Ordering::Acquire);
         self.db.insert(b"meta:errors", error_val.to_le_bytes().to_vec())
@@ -510,7 +499,7 @@ impl AsyncPersistenceQueue {
     /// This is called automatically when the queue is dropped
     fn shutdown_io_worker(&mut self) {
         // Phase 3: Flush any remaining WAL items before shutdown
-        let mut wal_to_flush = {
+        let wal_to_flush = {
             let mut wal = self.wal_buffer.lock().unwrap();
             if !wal.is_empty() {
                 wal.drain(..).collect::<Vec<_>>()
