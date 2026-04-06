@@ -17,7 +17,7 @@ fn _rst_queue(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncPriorityQueue>()?;
     m.add_class::<PyQueueStats>()?;
     m.add_class::<PyProcessedResult>()?;
-    m.add("__version__", "0.3.0")?;
+    m.add("__version__", "0.1.8")?;
     
     // Add constants
     m.add("SEQUENTIAL", 0)?;
@@ -154,7 +154,7 @@ impl PyAsyncQueue {
     #[staticmethod]
     #[pyo3(signature = (mode = 1, buffer_size = 128, storage_path = "./queue_data", auto_restore = true))]
     fn new_with_persistence(mode: u8, buffer_size: usize, storage_path: &str, auto_restore: bool) -> PyResult<Self> {
-        let mut queue = AsyncQueue::new_with_persistence(mode, buffer_size, storage_path, auto_restore)
+        let queue = AsyncQueue::new_with_persistence(mode, buffer_size, storage_path, auto_restore)
             .map_err(|e| PyTypeError::new_err(e))?;
         Ok(PyAsyncQueue { inner: queue })
     }

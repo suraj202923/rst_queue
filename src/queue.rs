@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam::queue::SegQueue;
 use std::path::PathBuf;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::Write;
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 
@@ -100,6 +100,7 @@ pub struct AsyncQueue {
 
 /// Result batch for processing multiple items at once
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ResultBatch {
     results: Vec<ProcessedResult>,
 }
@@ -333,7 +334,7 @@ impl AsyncQueue {
 
     /// Block and get a processed result (uses spin-wait with backoff)
     pub fn get_blocking(&self) -> Result<ProcessedResult, String> {
-        let mut backoff = crossbeam::utils::Backoff::new();
+        let backoff = crossbeam::utils::Backoff::new();
         loop {
             if let Some(result) = self.result_queue.pop() {
                 self.removed_count.fetch_add(1, Ordering::AcqRel);

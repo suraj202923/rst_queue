@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
-use crossbeam::channel::{bounded, Sender, Receiver};
+use crossbeam::channel::{bounded, Sender};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::path::PathBuf;
 
@@ -79,6 +79,7 @@ pub struct PriorityStats {
 }
 
 /// Main async priority queue
+#[allow(dead_code)]
 pub struct AsyncPriorityQueue {
     item_queue: Arc<Mutex<BinaryHeap<PrioritizedQueueItem>>>,
     guid_index: Arc<Mutex<HashMap<String, Priority>>>,
@@ -94,7 +95,7 @@ pub struct AsyncPriorityQueue {
 
 impl AsyncPriorityQueue {
     /// Create new async priority queue
-    pub fn new(mode: u8, storage_path: &str) -> Result<Self, String> {
+    pub fn new(_mode: u8, storage_path: &str) -> Result<Self, String> {
         let path = PathBuf::from(storage_path);
         
         // Create directory if not exists

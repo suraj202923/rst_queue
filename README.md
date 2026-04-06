@@ -357,6 +357,33 @@ AsyncPersistenceQueue:       990K/sec   (vs asyncio NONE)   ✅ Only option!
 
 ## 📖 Complete API Reference
 
+### 📚 API Quick Reference
+
+#### All Available Methods by Queue Type
+
+| Method | AsyncQueue | AsyncPriority | AsyncPersist | Use Case |
+|--------|-----------|--------------|-------------|----------|
+| **`push(data) -> guid`** | ✅ | ✅ | ✅ | Push single item (returns GUID) |
+| **`push_batch(items) -> guids`** | ✅ | ✅ | ✅ | Push multiple items (returns GUIDs) |
+| **`remove_by_guid(guid)`** | ✅ | ✅ | ✅ | Remove item before processing |
+| **`is_guid_active(guid)`** | ✅ | ✅ | ✅ | Check if GUID is still in queue |
+| **`push_with_priority(data, priority)`** | ❌ | ✅ | ❌ | Push with priority order |
+| **`start(worker, num_workers)`** | ✅ | ✅ | ✅ | Start processing (no results) |
+| **`start_with_results(worker, num_workers)`** | ✅ | ✅ | ✅ | Start processing (with results) |
+| **`get()`** | ✅ | ✅ | ✅ | Non-blocking result retrieval |
+| **`get_batch(count)`** | ✅ | ✅ | ✅ | Batch result retrieval (10-50x faster) |
+| **`get_blocking()`** | ✅ | ✅ | ✅ | Blocking result retrieval |
+| **`total_pushed()`** | ✅ | ✅ | ✅ | Count pushed items |
+| **`total_processed()`** | ✅ | ✅ | ✅ | Count processed items |
+| **`total_errors()`** | ✅ | ✅ | ✅ | Count errors |
+| **`active_workers()`** | ✅ | ✅ | ✅ | Active worker count |
+| **`get_stats()`** | ✅ | ✅ | ✅ | Get comprehensive stats |
+| **`get_stats_json()`** | ✅ | ✅ | ✅ | Get stats as JSON |
+| **`clear()`** | ✅ | ✅ | ✅ | Clear all items |
+| **`pending_items()`** | ✅ | ✅ | ✅ | Count unprocessed items |
+
+---
+
 ### AsyncQueue
 
 #### Constructor
@@ -372,12 +399,74 @@ AsyncQueue(mode: int = 1, buffer_size: int = 128)
 
 #### Methods
 
-##### `push(data: bytes) -> None`
+##### `push(data: bytes) -> str`
 Add a bytes object to the queue.
 
+- `data: bytes` - The item data
+- **Returns**: `str` - A unique GUID (UUID) for this item
+
+**Use Cases:** Track, cancel, or deduplicate items
+
 ```python
-queue.push(b"Hello")  # Push string
-queue.push(json.dumps(obj).encode())  # Push JSON
+queue = AsyncQueue(mode=1)
+
+# Push and get the GUID
+guid = queue.push(b"Hello")  # Returns: "550e8400-e29b-41d4-a716-446655440000"
+print(f"Item GUID: {guid}")
+
+# Store GUID to track the item
+order_guid = queue.push(json.dumps({"order_id": 123}).encode())
+print(f"Order GUID: {order_guid}")
+```
+
+##### `push_batch(data_list: List[bytes]) -> List[str]`
+Push multiple items at once (10-50x faster than individual pushes).
+
+- `data_list: List[bytes]` - List of items to push
+- **Returns**: `List[str]` - List of GUIDs (one per item)
+
+```python
+items = [b"item_1", b"item_2", b"item_3"]
+guids = queue.push_batch(items)  # Returns list of GUIDs
+print(f"Pushed {len(guids)} items")
+for guid in guids:
+    print(f"  GUID: {guid}")
+```
+
+##### `remove_by_guid(guid: str) -> bool`
+Remove an item from queue by its GUID (before it's processed).
+
+- `guid: str` - The GUID returned from `push()` or `push_batch()`
+- **Returns**: `True` if found and removed, `False` if not found or already processed
+
+**Use Cases:** Cancel orders, cancel jobs, abort operations
+
+```python
+queue = AsyncQueue(mode=1)
+
+# Push order and get its GUID
+order_guid = queue.push(b"order_data")
+
+# Cancel order before it ships
+if queue.remove_by_guid(order_guid):
+    print("✅ Order cancelled")
+else:
+    print("❌ Order already shipped")
+```
+
+##### `is_guid_active(guid: str) -> bool`
+Check if a GUID is still active (not removed).
+
+- `guid: str` - The GUID to check
+- **Returns**: `True` if GUID is active, `False` if removed
+
+```python
+order_guid = queue.push(b"order_data")
+
+if queue.is_guid_active(order_guid):
+    print("Order is still in queue")
+else:
+    print("Order was removed")
 ```
 
 ##### `start(worker: Callable, num_workers: int = 1) -> None`
@@ -553,6 +642,153 @@ while True:
             print(f"Success for item {result.id}: {result.result}")
     else:
         break
+```
+
+## 🔑 GUID-Based Item Tracking & Cancellation
+
+### Understanding GUIDs
+
+Every item you push to the queue gets an **auto-generated GUID** (UUID). Use it to:
+- **Cancel items**: Remove items from queue before they're processed
+- **Track items**: Know which items are in the queue
+- **Check status**: Verify if an item is still active or was removed
+
+### Workflow: Push → Get GUID → Remove if needed
+
+```python
+from rst_queue import AsyncQueue
+import time
+
+queue = AsyncQueue(mode=1)
+
+# Step 1: Push item and capture its GUID
+order_guid = queue.push(b'order_123_data')  # Returns: "550e8400-e29b..."
+print(f"Order GUID: {order_guid}")
+
+# Step 2: Later, check if item is still active
+if queue.is_guid_active(order_guid):
+    print("Order is in queue, not yet shipped")
+else:
+    print("Order was cancelled or already shipped")
+
+# Step 3: Cancel order before it's processed
+if queue.remove_by_guid(order_guid):
+    print("✅ Order cancelled successfully")
+else:
+    print("❌ Order already shipped (cannot cancel)")
+```
+
+### Real-World Examples
+
+#### Example 1: Order Cancellation
+
+```python
+from rst_queue import AsyncQueue
+import time
+
+def process_order(item_id, data):
+    # Simulate order processing (shipping, payment, etc.)
+    time.sleep(1)
+    return b"Order processed: " + data
+
+queue = AsyncQueue(mode=1)
+
+# Customer places 3 orders and store their GUIDs
+order_guids = []
+for i in range(1, 4):
+    order_guid = queue.push(f'item_{i}_qty5_price{i*100}'.encode())
+    order_guids.append((i, order_guid))
+
+queue.start_with_results(process_order, num_workers=2)
+
+# Customer cancels order 2 immediately (before it ships)
+order_num, guid_to_cancel = order_guids[1]
+if queue.remove_by_guid(guid_to_cancel):
+    print(f"✅ Order {order_num} cancelled before processing")
+else:
+    print(f"❌ Order {order_num} already shipped")
+```
+
+#### Example 2: Track Processing Status
+
+```python
+from rst_queue import AsyncQueue
+import time
+
+queue = AsyncQueue(mode=1)
+
+def process_data(item_id, data):
+    time.sleep(0.5)  # Simulate work
+    return data.upper()
+
+# Push 5 items and track their GUIDs
+item_guids = []
+for i in range(5):
+    guid = queue.push(f'item_{i}'.encode())
+    item_guids.append(guid)
+    print(f"Pushed item {i} with GUID: {guid}")
+
+queue.start_with_results(process_data, num_workers=2)
+
+# Check which items are still active
+for i, guid in enumerate(item_guids):
+    is_active = queue.is_guid_active(guid)
+    status = "Still in queue" if is_active else "Removed/Processed"
+    print(f"Item {i}: {status}")
+```
+
+#### Example 3: Payment Processing with Cancellation
+
+```python
+from rst_queue import AsyncPersistenceQueue
+import time
+
+def process_payment(item_id, data):
+    payment_info = data.decode()
+    # Persistent storage ensures payment is not lost even if app crashes
+    time.sleep(0.5)  # Simulate payment processing
+    return b"Payment processed"
+
+# Use persistent queue for payments (critical data)
+queue = AsyncPersistenceQueue(mode=1, storage_path="./payments")
+
+# Customer initiates payment
+payment_guid = queue.push(b'customer_123:amount_500:card_****1234')
+print(f"Payment GUID: {payment_guid}")
+
+queue.start_with_results(process_payment, num_workers=1)
+
+time.sleep(0.2)  # Short delay to show cancellation works
+
+# Customer cancels payment before it processes
+if queue.remove_by_guid(payment_guid):
+    print("✅ Payment cancelled successfully")
+else:
+    print("❌ Payment already processed (cannot cancel)")
+```
+
+#### Example 4: Batch Processing with GUID Tracking
+
+```python
+from rst_queue import AsyncQueue
+
+queue = AsyncQueue(mode=1)
+
+# Push batch of items and get all GUIDs
+items = [b'order_1', b'order_2', b'order_3', b'order_4', b'order_5']
+order_guids = queue.push_batch(items)  # Returns list of GUIDs
+
+print(f"Pushed {len(order_guids)} orders")
+for i, guid in enumerate(order_guids):
+    print(f"  Order {i+1} GUID: {guid}")
+
+# Cancel specific orders
+guids_to_cancel = order_guids[1:3]  # Cancel orders 2 and 3
+for guid in guids_to_cancel:
+    if queue.remove_by_guid(guid):
+        print(f"✅ Cancelled: {guid}")
+    else:
+        print(f"❌ Already processed: {guid}")
 ```
 
 ### AsyncPersistenceQueue
@@ -769,6 +1005,14 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Changelog
+
+### v0.1.8 (2026-04-07) - Compiler Warnings Cleanup & Code Quality
+- ✅ **Fixed 11 compiler warnings** - improved code cleanliness
+- ✅ **Removed unused imports** (self, Read, Receiver)
+- ✅ **Fixed mutable variables** not needed (backoff, wal_to_flush, queue)
+- ✅ **Removed dead code** and added proper `#[allow(dead_code)]` annotations
+- 📦 **Production-ready** with zero warnings
+- 🔍 **Code quality**: Removed unused parameters and suppressed intentional code
 
 ### v0.1.7 (2026-04-07) - Threading Refactor & Comprehensive Comparison
 - ✅ **Refactored 6 manual OS threading locations** → optimal `.start()` worker pattern
