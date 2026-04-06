@@ -4,6 +4,8 @@ use crossbeam::queue::SegQueue;
 use std::path::PathBuf;
 use std::fs;
 use std::io::{self, Read, Write};
+use uuid::Uuid;
+use std::collections::{HashMap, HashSet};
 
 /// Execution mode for the queue
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,6 +38,7 @@ impl ExecutionMode {
 #[derive(Clone, Debug)]
 pub struct QueueItem {
     pub id: u64,
+    pub guid: String,
     pub data: Vec<u8>,
 }
 
@@ -84,6 +87,12 @@ pub struct AsyncQueue {
     /// Flag to signal workers to stop
     is_closed: Arc<AtomicUsize>, // Using 1=closed, 0=open
     
+    /// GUID to item ID mapping
+    guid_index: Arc<Mutex<HashMap<String, u64>>>,
+    
+    /// Removed GUIDs (to skip processing)
+    removed_guids: Arc<Mutex<HashSet<String>>>,
+    
     /// Persistence settings
     persistence_enabled: bool,
     persistence_path: Option<PathBuf>,
@@ -120,8 +129,8 @@ impl AsyncQueue {
             error_count: Arc::new(AtomicU64::new(0)),
             removed_count: Arc::new(AtomicU64::new(0)),
             mode: Arc::new(Mutex::new(execution_mode)),
-            is_closed: Arc::new(AtomicUsize::new(0)),
-            persistence_enabled: false,
+            is_closed: Arc::new(AtomicUsize::new(0)),            guid_index: Arc::new(Mutex::new(HashMap::new())),
+            removed_guids: Arc::new(Mutex::new(HashSet::new())),            persistence_enabled: false,
             persistence_path: None,
         })
     }
@@ -165,6 +174,8 @@ impl AsyncQueue {
             removed_count: Arc::new(AtomicU64::new(0)),
             mode: Arc::new(Mutex::new(execution_mode)),
             is_closed: Arc::new(AtomicUsize::new(0)),
+            guid_index: Arc::new(Mutex::new(HashMap::new())),
+            removed_guids: Arc::new(Mutex::new(HashSet::new())),
             persistence_enabled: true,
             persistence_path: Some(path),
         };
@@ -177,31 +188,74 @@ impl AsyncQueue {
         Ok(queue)
     }
 
-    /// Push an item to the queue (lock-free)
-    pub fn push(&self, data: Vec<u8>) -> Result<(), String> {
+    /// Push an item to the queue (lock-free), returns GUID
+    pub fn push(&self, data: Vec<u8>) -> Result<String, String> {
         if self.is_closed.load(Ordering::Acquire) != 0 {
             return Err("Queue is closed".to_string());
         }
 
         let id = self.counter.fetch_add(1, Ordering::AcqRel) + 1;
-        let item = QueueItem { id, data };
+        let guid = Uuid::new_v4().to_string();
+        let item = QueueItem { id, guid: guid.clone(), data };
+        
+        // Add to GUID index
+        {
+            let mut index = self.guid_index.lock().unwrap();
+            index.insert(guid.clone(), id);
+        }
+        
         self.item_queue.push(item);
-        Ok(())
+        Ok(guid)
     }
 
-    /// Batch push items for higher throughput
-    pub fn push_batch(&self, items: Vec<Vec<u8>>) -> Result<Vec<u64>, String> {
+    /// Batch push items for higher throughput, returns GUIDs
+    pub fn push_batch(&self, items: Vec<Vec<u8>>) -> Result<Vec<String>, String> {
         if self.is_closed.load(Ordering::Acquire) != 0 {
             return Err("Queue is closed".to_string());
         }
 
-        let mut ids = Vec::with_capacity(items.len());
+        let mut guids = Vec::with_capacity(items.len());
+        let mut index_updates = HashMap::new();
+        
         for data in items {
             let id = self.counter.fetch_add(1, Ordering::AcqRel) + 1;
-            self.item_queue.push(QueueItem { id, data });
-            ids.push(id);
+            let guid = Uuid::new_v4().to_string();
+            self.item_queue.push(QueueItem { id, guid: guid.clone(), data });
+            guids.push(guid.clone());
+            index_updates.insert(guid, id);
         }
-        Ok(ids)
+        
+        // Add all to GUID index
+        {
+            let mut index = self.guid_index.lock().unwrap();
+            index.extend(index_updates);
+        }
+        
+        Ok(guids)
+    }
+    
+    /// Remove item by GUID (before it's processed)
+    pub fn remove_by_guid(&self, guid: &str) -> bool {
+        // Remove from index
+        let removed = {
+            let mut index = self.guid_index.lock().unwrap();
+            index.remove(guid).is_some()
+        };
+        
+        // Add to removed set (workers will skip it)
+        if removed {
+            let mut removed_set = self.removed_guids.lock().unwrap();
+            removed_set.insert(guid.to_string());
+            self.removed_count.fetch_add(1, Ordering::AcqRel);
+        }
+        
+        removed
+    }
+    
+    /// Check if GUID is still active (not removed)
+    pub fn is_guid_active(&self, guid: &str) -> bool {
+        let removed_set = self.removed_guids.lock().unwrap();
+        !removed_set.contains(guid)
     }
 
     /// Get the current mode (0 for Sequential, 1 for Parallel)
@@ -365,6 +419,7 @@ impl AsyncQueue {
         let item_queue = Arc::clone(&self.item_queue);
         let active_workers = Arc::clone(&self.active_workers);
         let processed_count = Arc::clone(&self.processed_count);
+        let removed_guids = Arc::clone(&self.removed_guids);
 
         std::thread::spawn(move || {
             loop {
@@ -374,10 +429,18 @@ impl AsyncQueue {
                         continue;
                     }
                     Some(item) => {
-                        active_workers.fetch_add(1, Ordering::AcqRel);
-                        worker(item.id, item.data);
-                        processed_count.fetch_add(1, Ordering::AcqRel);
-                        active_workers.fetch_sub(1, Ordering::AcqRel);
+                        // Check if this item was removed
+                        let is_removed = {
+                            let removed_set = removed_guids.lock().unwrap();
+                            removed_set.contains(&item.guid)
+                        };
+                        
+                        if !is_removed {
+                            active_workers.fetch_add(1, Ordering::AcqRel);
+                            worker(item.id, item.data);
+                            processed_count.fetch_add(1, Ordering::AcqRel);
+                            active_workers.fetch_sub(1, Ordering::AcqRel);
+                        }
                     }
                 }
             }
@@ -393,6 +456,7 @@ impl AsyncQueue {
         let active_workers = Arc::clone(&self.active_workers);
         let processed_count = Arc::clone(&self.processed_count);
         let error_count = Arc::clone(&self.error_count);
+        let removed_guids = Arc::clone(&self.removed_guids);
 
         std::thread::spawn(move || {
             loop {
@@ -402,86 +466,13 @@ impl AsyncQueue {
                         continue;
                     }
                     Some(item) => {
-                        active_workers.fetch_add(1, Ordering::AcqRel);
-                        let result = worker(item.id, item.data);
-
-                        match result {
-                            Ok(output) => {
-                                result_queue.push(ProcessedResult {
-                                    id: item.id,
-                                    result: output,
-                                    error: None,
-                                });
-                                processed_count.fetch_add(1, Ordering::AcqRel);
-                            }
-                            Err(e) => {
-                                result_queue.push(ProcessedResult {
-                                    id: item.id,
-                                    result: Vec::new(),
-                                    error: Some(e),
-                                });
-                                error_count.fetch_add(1, Ordering::AcqRel);
-                                processed_count.fetch_add(1, Ordering::AcqRel);
-                            }
-                        }
-
-                        active_workers.fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Spawn parallel worker threads (thread pool approach)
-    fn spawn_parallel_workers(&self, worker: WorkerFn, num_workers: usize) -> Result<(), String> {
-        for _ in 0..num_workers {
-            let item_queue = Arc::clone(&self.item_queue);
-            let active_workers = Arc::clone(&self.active_workers);
-            let processed_count = Arc::clone(&self.processed_count);
-            let worker = Arc::clone(&worker);
-
-            std::thread::spawn(move || {
-                loop {
-                    match item_queue.pop() {
-                        None => {
-                            // No items, sleep briefly
-                            std::thread::sleep(std::time::Duration::from_micros(100));
-                            continue;
-                        }
-                        Some(item) => {
-                            active_workers.fetch_add(1, Ordering::AcqRel);
-                            worker(item.id, item.data);
-                            processed_count.fetch_add(1, Ordering::AcqRel);
-                            active_workers.fetch_sub(1, Ordering::AcqRel);
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Spawn parallel worker threads that return results
-    fn spawn_parallel_workers_with_results(&self, worker: ResultWorkerFn, num_workers: usize) -> Result<(), String> {
-        for _ in 0..num_workers {
-            let item_queue = Arc::clone(&self.item_queue);
-            let result_queue = Arc::clone(&self.result_queue);
-            let active_workers = Arc::clone(&self.active_workers);
-            let processed_count = Arc::clone(&self.processed_count);
-            let error_count = Arc::clone(&self.error_count);
-            let worker = Arc::clone(&worker);
-
-            std::thread::spawn(move || {
-                loop {
-                    match item_queue.pop() {
-                        None => {
-                            std::thread::sleep(std::time::Duration::from_micros(100));
-                            continue;
-                        }
-                        Some(item) => {
+                        // Check if this item was removed
+                        let is_removed = {
+                            let removed_set = removed_guids.lock().unwrap();
+                            removed_set.contains(&item.guid)
+                        };
+                        
+                        if !is_removed {
                             active_workers.fetch_add(1, Ordering::AcqRel);
                             let result = worker(item.id, item.data);
 
@@ -506,6 +497,105 @@ impl AsyncQueue {
                             }
 
                             active_workers.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Spawn parallel worker threads (thread pool approach)
+    fn spawn_parallel_workers(&self, worker: WorkerFn, num_workers: usize) -> Result<(), String> {
+        for _ in 0..num_workers {
+            let item_queue = Arc::clone(&self.item_queue);
+            let active_workers = Arc::clone(&self.active_workers);
+            let processed_count = Arc::clone(&self.processed_count);
+            let removed_guids = Arc::clone(&self.removed_guids);
+            let worker = Arc::clone(&worker);
+
+            std::thread::spawn(move || {
+                loop {
+                    match item_queue.pop() {
+                        None => {
+                            // No items, sleep briefly
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            continue;
+                        }
+                        Some(item) => {
+                            // Check if this item was removed
+                            let is_removed = {
+                                let removed_set = removed_guids.lock().unwrap();
+                                removed_set.contains(&item.guid)
+                            };
+                            
+                            if !is_removed {
+                                active_workers.fetch_add(1, Ordering::AcqRel);
+                                worker(item.id, item.data);
+                                processed_count.fetch_add(1, Ordering::AcqRel);
+                                active_workers.fetch_sub(1, Ordering::AcqRel);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Spawn parallel worker threads that return results
+    fn spawn_parallel_workers_with_results(&self, worker: ResultWorkerFn, num_workers: usize) -> Result<(), String> {
+        for _ in 0..num_workers {
+            let item_queue = Arc::clone(&self.item_queue);
+            let result_queue = Arc::clone(&self.result_queue);
+            let active_workers = Arc::clone(&self.active_workers);
+            let processed_count = Arc::clone(&self.processed_count);
+            let error_count = Arc::clone(&self.error_count);
+            let removed_guids = Arc::clone(&self.removed_guids);
+            let worker = Arc::clone(&worker);
+
+            std::thread::spawn(move || {
+                loop {
+                    match item_queue.pop() {
+                        None => {
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            continue;
+                        }
+                        Some(item) => {
+                            // Check if this item was removed
+                            let is_removed = {
+                                let removed_set = removed_guids.lock().unwrap();
+                                removed_set.contains(&item.guid)
+                            };
+                            
+                            if !is_removed {
+                                active_workers.fetch_add(1, Ordering::AcqRel);
+                                let result = worker(item.id, item.data);
+
+                                match result {
+                                    Ok(output) => {
+                                        result_queue.push(ProcessedResult {
+                                            id: item.id,
+                                            result: output,
+                                            error: None,
+                                        });
+                                        processed_count.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                    Err(e) => {
+                                        result_queue.push(ProcessedResult {
+                                            id: item.id,
+                                            result: Vec::new(),
+                                            error: Some(e),
+                                        });
+                                        error_count.fetch_add(1, Ordering::AcqRel);
+                                        processed_count.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                }
+
+                                active_workers.fetch_sub(1, Ordering::AcqRel);
+                            }
                         }
                     }
                 }
@@ -630,6 +720,7 @@ impl AsyncQueue {
                 // Create QueueItem with id 0 (user should extract from encoded data)
                 let item = QueueItem {
                     id: self.counter.fetch_add(1, Ordering::AcqRel),
+                    guid: Uuid::new_v4().to_string(),
                     data: item_data,
                 };
                 self.item_queue.push(item);

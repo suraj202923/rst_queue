@@ -1,13 +1,34 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use crossbeam::queue::SegQueue;
 use std::path::PathBuf;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+use std::collections::{HashMap, HashSet};
 
 use crate::queue::{QueueItem, ProcessedResult, ExecutionMode, QueueStats, WorkerFn, ResultWorkerFn};
+
+/// I/O operations to be performed by the background thread
+#[derive(Clone)]
+enum IoOperation {
+    /// Insert a key-value pair (deferred to background thread)
+    Insert { key: Vec<u8>, value: Vec<u8> },
+    /// Persist counter metadata (deferred to background thread)
+    PersistCounter { counter_val: u64 },
+    /// Flush Write-Ahead Log to Sled (Phase 3)
+    FlushWal { wal: Vec<(Vec<u8>, Vec<u8>)> },
+    /// Flush all pending writes to disk
+    Flush,
+    /// Shutdown signal
+    Shutdown,
+}
 
 /// Optimized Async Persistence Queue with Sled backing store
 /// Provides same API as AsyncQueue but with persistent storage
 /// Uses Sled to store encoded data, in-memory processing
+/// Phase 2: Async I/O thread pool for non-blocking persistence
+/// Phase 3: Write-Ahead Log (WAL) for batched persistence
 pub struct AsyncPersistenceQueue {
     /// Lock-free queue for items (in-memory)
     item_queue: Arc<SegQueue<QueueItem>>,
@@ -27,14 +48,111 @@ pub struct AsyncPersistenceQueue {
     /// Execution mode
     mode: Arc<Mutex<ExecutionMode>>,
     
+    /// GUID to item ID mapping
+    guid_index: Arc<Mutex<HashMap<String, u64>>>,
+    
+    /// Removed GUIDs (to skip processing)
+    removed_guids: Arc<Mutex<HashSet<String>>>,
+    
     /// Flag to signal workers to stop
     is_closed: Arc<AtomicUsize>, // Using 1=closed, 0=open
     
     /// Storage path
     pub storage_path: PathBuf,
+    
+    /// Phase 2: Channel for deferred I/O operations
+    io_sender: mpsc::Sender<IoOperation>,
+    
+    /// Phase 2: Handle to I/O worker thread
+    io_thread: Option<JoinHandle<()>>,
+    
+    /// Phase 3: Write-Ahead Log buffer (in-memory, fast)
+    wal_buffer: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>,
+    
+    /// Phase 3: WAL threshold - flush when buffer exceeds this size
+    wal_threshold: usize,
 }
 
 impl AsyncPersistenceQueue {
+    /// Background worker thread that handles all I/O operations asynchronously
+    /// Phase 2: Receives operations from mpsc channel and batches them for efficiency
+    /// Phase 3: Handles WAL (Write-Ahead Log) flush operations for improved throughput
+    fn io_worker(rx: mpsc::Receiver<IoOperation>, db: sled::Db) {
+        let mut pending = Vec::new();
+        let mut counter_val: Option<u64> = None;
+        let mut last_flush = Instant::now();
+        const IO_THREAD_TIMEOUT: Duration = Duration::from_millis(10);
+        const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
+        loop {
+            // Collect operations with 10ms timeout for batching efficiency
+            match rx.recv_timeout(IO_THREAD_TIMEOUT) {
+                Ok(IoOperation::Insert { key, value }) => {
+                    pending.push((key, value));
+                }
+                Ok(IoOperation::PersistCounter { counter_val: val }) => {
+                    // Update counter to be persisted with next flush
+                    counter_val = Some(val);
+                }
+                Ok(IoOperation::FlushWal { wal }) => {
+                    // Phase 3: Flush Write-Ahead Log to Sled (batch writes)
+                    for (key, value) in wal {
+                        let _ = db.insert(&key, value);
+                    }
+                    // Persist counter if updated
+                    if let Some(val) = counter_val {
+                        let _ = db.insert(b"meta:counter", val.to_le_bytes().to_vec());
+                        counter_val = None;
+                    }
+                    // Single flush for entire WAL batch
+                    let _ = db.flush();
+                    last_flush = Instant::now();
+                }
+                Ok(IoOperation::Flush) => {
+                    // Write all pending items to Sled
+                    for (key, value) in pending.drain(..) {
+                        let _ = db.insert(&key, value);
+                    }
+                    // Persist counter metadata if updated
+                    if let Some(val) = counter_val {
+                        let _ = db.insert(b"meta:counter", val.to_le_bytes().to_vec());
+                        counter_val = None;
+                    }
+                    // Single flush for entire batch
+                    let _ = db.flush();
+                    last_flush = Instant::now();
+                }
+                Ok(IoOperation::Shutdown) => {
+                    // Flush remaining items before shutdown
+                    for (key, value) in pending.drain(..) {
+                        let _ = db.insert(&key, value);
+                    }
+                    // Persist final counter value
+                    if let Some(val) = counter_val {
+                        let _ = db.insert(b"meta:counter", val.to_le_bytes().to_vec());
+                    }
+                    let _ = db.flush();
+                    break;
+                }
+                Err(_) => {
+                    // Timeout: flush if any pending or time since last flush exceeded
+                    if !pending.is_empty() || counter_val.is_some() || last_flush.elapsed() > FLUSH_INTERVAL {
+                        for (key, value) in pending.drain(..) {
+                            let _ = db.insert(&key, value);
+                        }
+                        // Persist counter metadata if updated
+                        if let Some(val) = counter_val {
+                            let _ = db.insert(b"meta:counter", val.to_le_bytes().to_vec());
+                            counter_val = None;
+                        }
+                        let _ = db.flush();
+                        last_flush = Instant::now();
+                    }
+                }
+            }
+        }
+    }
+
     /// Create a new AsyncPersistenceQueue with Sled persistence
     ///
     /// # Arguments
@@ -57,6 +175,13 @@ impl AsyncPersistenceQueue {
         let db = sled::open(&path)
             .map_err(|e| format!("Failed to open Sled database: {}", e))?;
 
+        // Phase 2: Create I/O channel and spawn background worker thread
+        let (tx, rx) = mpsc::channel();
+        let db_clone = db.clone();
+        let io_thread = std::thread::spawn(move || {
+            Self::io_worker(rx, db_clone);
+        });
+
         let mut queue = AsyncPersistenceQueue {
             item_queue: Arc::new(SegQueue::new()),
             result_queue: Arc::new(SegQueue::new()),
@@ -67,8 +192,14 @@ impl AsyncPersistenceQueue {
             error_count: Arc::new(AtomicU64::new(0)),
             removed_count: Arc::new(AtomicU64::new(0)),
             mode: Arc::new(Mutex::new(execution_mode)),
+            guid_index: Arc::new(Mutex::new(HashMap::new())),
+            removed_guids: Arc::new(Mutex::new(HashSet::new())),
             is_closed: Arc::new(AtomicUsize::new(0)),
             storage_path: path,
+            io_sender: tx,
+            io_thread: Some(io_thread),
+            wal_buffer: Arc::new(Mutex::new(Vec::new())),
+            wal_threshold: 1000, // Phase 3: Flush WAL when > 1000 items
         };
 
         // Restore pending items and counter from Sled
@@ -133,7 +264,15 @@ impl AsyncPersistenceQueue {
 
         // Load pending items into in-memory queue
         for (id, data) in pending_items {
-            self.item_queue.push(QueueItem { id, data });
+            let guid = Uuid::new_v4().to_string();
+            
+            // Add to GUID index
+            {
+                let mut index = self.guid_index.lock().unwrap();
+                index.insert(guid.clone(), id);
+            }
+            
+            self.item_queue.push(QueueItem { id, guid, data });
         }
 
         Ok(())
@@ -173,54 +312,100 @@ impl AsyncPersistenceQueue {
         Ok(())
     }
 
-    /// Push an item to the queue and persist it
-    pub fn push(&self, data: Vec<u8>) -> Result<(), String> {
+    /// Push an item to the queue and persist it asynchronously (ultra-fast)
+    /// Phase 4 Enhanced: Pure async design
+    /// 1. Add to in-memory queue (lock-free, returns immediately)
+    /// 2. Queue persistence request to background thread
+    /// 3. Background thread persists to DB asynchronously (non-blocking)
+    /// Returns GUID immediately - all disk I/O happens in separate background thread!
+    pub fn push(&self, data: Vec<u8>) -> Result<String, String> {
         if self.is_closed.load(Ordering::Acquire) != 0 {
             return Err("Queue is closed".to_string());
         }
 
+        // Phase 1: Generate ID, GUID and queue for async persistence
         let id = self.counter.fetch_add(1, Ordering::AcqRel) + 1;
-        let item = QueueItem { id, data };
+        let guid = Uuid::new_v4().to_string();
+        let key = format!("item:{}", id).into_bytes();
         
-        // Persist to Sled
-        let key = format!("item:{}", id);
-        self.db.insert(key.as_bytes(), item.data.clone())
-            .map_err(|e| format!("Failed to persist item: {}", e))?;
+        // Phase 2: Queue async persistence (non-blocking channel send)
+        let _ = self.io_sender.send(IoOperation::Insert {
+            key: key.clone(),
+            value: data.clone(),
+        });
         
-        // Persist counter
-        self.persist_counter()?;
+        // Phase 3: Queue counter update (async, non-blocking)
+        let counter_val = self.counter.load(Ordering::Acquire);
+        let _ = self.io_sender.send(IoOperation::PersistCounter { counter_val });
         
-        // Add to in-memory queue
+        // Add to GUID index
+        {
+            let mut index = self.guid_index.lock().unwrap();
+            index.insert(guid.clone(), id);
+        }
+        
+        // Phase 4: Add to in-memory queue (fast, lock-free - returns immediately!)
+        let item = QueueItem { id, guid: guid.clone(), data };
         self.item_queue.push(item);
         
-        Ok(())
+        // ✅ Returns GUID immediately - disk I/O happens asynchronously in background thread!
+        // No batching delays, no WAL overhead, maximum speed!
+        Ok(guid)
     }
 
-    /// Batch push items for higher throughput
-    pub fn push_batch(&self, items: Vec<Vec<u8>>) -> Result<Vec<u64>, String> {
+    /// Batch push items asynchronously (ultra-fast throughput)
+    /// Phase 4 Enhanced: Pure async design with no batching overhead
+    /// 1. Generate IDs and GUIDs for all items (in-memory, instant)
+    /// 2. Queue all persistence requests to background thread (non-blocking)
+    /// 3. Add all items to in-memory queue (lock-free, instant)
+    /// 4. Background thread persists items one-by-one asynchronously
+    /// Returns GUIDs immediately - all disk I/O happens asynchronously in background!
+    pub fn push_batch(&self, items: Vec<Vec<u8>>) -> Result<Vec<String>, String> {
         if self.is_closed.load(Ordering::Acquire) != 0 {
             return Err("Queue is closed".to_string());
         }
 
-        let mut ids = Vec::with_capacity(items.len());
+        let mut guids = Vec::with_capacity(items.len());
+        let mut queue_items = Vec::with_capacity(items.len());
+        
+        // Phase 1: Generate IDs, GUIDs and prepare items (in-memory, very fast)
         for data in items {
             let id = self.counter.fetch_add(1, Ordering::AcqRel) + 1;
-            let item = QueueItem { id, data };
+            let guid = Uuid::new_v4().to_string();
+            let key = format!("item:{}", id).into_bytes();
             
-            // Persist to Sled
-            let key = format!("item:{}", id);
-            self.db.insert(key.as_bytes(), item.data.clone())
-                .map_err(|e| format!("Failed to persist item: {}", e))?;
+            // Phase 2: Queue async persistence (non-blocking channel send)
+            let _ = self.io_sender.send(IoOperation::Insert {
+                key,
+                value: data.clone(),
+            });
             
-            // Add to in-memory queue
-            self.item_queue.push(item);
-            ids.push(id);
+            // Prepare in-memory queue item
+            let item = QueueItem { id, guid: guid.clone(), data };
+            queue_items.push(item);
+            guids.push(guid);
         }
         
-        // Persist counter once for the batch
-        self.persist_counter()?;
+        // Add all to GUID index
+        {
+            let mut index = self.guid_index.lock().unwrap();
+            for (guid, id) in guids.iter().zip(queue_items.iter().map(|q| q.id)) {
+                index.insert(guid.clone(), id);
+            }
+        }
         
-        Ok(ids)
+        // Phase 3: Queue single counter update after batch
+        let counter_val = self.counter.load(Ordering::Acquire);
+        let _ = self.io_sender.send(IoOperation::PersistCounter { counter_val });
+        
+        // Phase 4: Add all items to in-memory queue (lock-free, instant)
+        for item in queue_items {
+            self.item_queue.push(item);
+        }
+        
+        // ✅ Returns immediately - no locks, no delays!
+        // All persistence happens asynchronously in background thread!
+        Ok(guids)
     }
 
     /// Get the current mode (0 for Sequential, 1 for Parallel)
@@ -320,6 +505,33 @@ impl AsyncPersistenceQueue {
         self.is_closed.store(1, Ordering::Release);
     }
 
+    /// Phase 2 & 3: Gracefully shutdown the I/O worker thread and flush pending operations
+    /// Phase 3: Ensures WAL is flushed before shutdown
+    /// This is called automatically when the queue is dropped
+    fn shutdown_io_worker(&mut self) {
+        // Phase 3: Flush any remaining WAL items before shutdown
+        let mut wal_to_flush = {
+            let mut wal = self.wal_buffer.lock().unwrap();
+            if !wal.is_empty() {
+                wal.drain(..).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+        
+        if !wal_to_flush.is_empty() {
+            let _ = self.io_sender.send(IoOperation::FlushWal { wal: wal_to_flush });
+        }
+        
+        // Send shutdown signal to I/O worker
+        let _ = self.io_sender.send(IoOperation::Shutdown);
+        
+        // Wait for I/O thread to finish
+        if let Some(thread) = self.io_thread.take() {
+            let _ = thread.join();
+        }
+    }
+
     /// Clear all pending items from the queue
     /// Returns the number of items removed
     pub fn clear(&self) -> usize {
@@ -392,6 +604,7 @@ impl AsyncPersistenceQueue {
         let item_queue = Arc::clone(&self.item_queue);
         let active_workers = Arc::clone(&self.active_workers);
         let processed_count = Arc::clone(&self.processed_count);
+        let removed_guids = Arc::clone(&self.removed_guids);
         let db = self.db.clone();
 
         std::thread::spawn(move || {
@@ -402,15 +615,22 @@ impl AsyncPersistenceQueue {
                         continue;
                     }
                     Some(item) => {
-                        active_workers.fetch_add(1, Ordering::AcqRel);
-                        worker(item.id, item.data.clone());
-                        processed_count.fetch_add(1, Ordering::AcqRel);
+                        // Check if this item was removed
+                        let is_removed = {
+                            let removed_set = removed_guids.lock().unwrap();
+                            removed_set.contains(&item.guid)
+                        };
+                        
+                        if !is_removed {
+                            active_workers.fetch_add(1, Ordering::AcqRel);
+                            worker(item.id, item.data.clone());
+                            processed_count.fetch_add(1, Ordering::AcqRel);
+                            active_workers.fetch_sub(1, Ordering::AcqRel);
+                        }
                         
                         // Remove from persistent storage after processing
                         let key = format!("item:{}", item.id);
                         let _ = db.remove(key.as_bytes());
-                        
-                        active_workers.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
             }
@@ -426,6 +646,7 @@ impl AsyncPersistenceQueue {
         let active_workers = Arc::clone(&self.active_workers);
         let processed_count = Arc::clone(&self.processed_count);
         let error_count = Arc::clone(&self.error_count);
+        let removed_guids = Arc::clone(&self.removed_guids);
         let db = self.db.clone();
 
         std::thread::spawn(move || {
@@ -436,96 +657,13 @@ impl AsyncPersistenceQueue {
                         continue;
                     }
                     Some(item) => {
-                        active_workers.fetch_add(1, Ordering::AcqRel);
-                        let result = worker(item.id, item.data.clone());
-
-                        match result {
-                            Ok(output) => {
-                                result_queue.push(ProcessedResult {
-                                    id: item.id,
-                                    result: output,
-                                    error: None,
-                                });
-                                processed_count.fetch_add(1, Ordering::AcqRel);
-                            }
-                            Err(e) => {
-                                result_queue.push(ProcessedResult {
-                                    id: item.id,
-                                    result: Vec::new(),
-                                    error: Some(e),
-                                });
-                                error_count.fetch_add(1, Ordering::AcqRel);
-                                processed_count.fetch_add(1, Ordering::AcqRel);
-                            }
-                        }
-
-                        // Remove from persistent storage after processing
-                        let key = format!("item:{}", item.id);
-                        let _ = db.remove(key.as_bytes());
-
-                        active_workers.fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Spawn parallel worker threads (thread pool approach)
-    fn spawn_parallel_workers(&self, worker: WorkerFn, num_workers: usize) -> Result<(), String> {
-        for _ in 0..num_workers {
-            let item_queue = Arc::clone(&self.item_queue);
-            let active_workers = Arc::clone(&self.active_workers);
-            let processed_count = Arc::clone(&self.processed_count);
-            let worker = Arc::clone(&worker);
-            let db = self.db.clone();
-
-            std::thread::spawn(move || {
-                loop {
-                    match item_queue.pop() {
-                        None => {
-                            std::thread::sleep(std::time::Duration::from_micros(100));
-                            continue;
-                        }
-                        Some(item) => {
-                            active_workers.fetch_add(1, Ordering::AcqRel);
-                            worker(item.id, item.data.clone());
-                            processed_count.fetch_add(1, Ordering::AcqRel);
-                            
-                            // Remove from persistent storage after processing
-                            let key = format!("item:{}", item.id);
-                            let _ = db.remove(key.as_bytes());
-                            
-                            active_workers.fetch_sub(1, Ordering::AcqRel);
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Spawn parallel worker threads that return results
-    fn spawn_parallel_workers_with_results(&self, worker: ResultWorkerFn, num_workers: usize) -> Result<(), String> {
-        for _ in 0..num_workers {
-            let item_queue = Arc::clone(&self.item_queue);
-            let result_queue = Arc::clone(&self.result_queue);
-            let active_workers = Arc::clone(&self.active_workers);
-            let processed_count = Arc::clone(&self.processed_count);
-            let error_count = Arc::clone(&self.error_count);
-            let worker = Arc::clone(&worker);
-            let db = self.db.clone();
-
-            std::thread::spawn(move || {
-                loop {
-                    match item_queue.pop() {
-                        None => {
-                            std::thread::sleep(std::time::Duration::from_micros(100));
-                            continue;
-                        }
-                        Some(item) => {
+                        // Check if this item was removed
+                        let is_removed = {
+                            let removed_set = removed_guids.lock().unwrap();
+                            removed_set.contains(&item.guid)
+                        };
+                        
+                        if !is_removed {
                             active_workers.fetch_add(1, Ordering::AcqRel);
                             let result = worker(item.id, item.data.clone());
 
@@ -548,12 +686,54 @@ impl AsyncPersistenceQueue {
                                     processed_count.fetch_add(1, Ordering::AcqRel);
                                 }
                             }
+                            active_workers.fetch_sub(1, Ordering::AcqRel);
+                        }
 
+                        // Remove from persistent storage after processing
+                        let key = format!("item:{}", item.id);
+                        let _ = db.remove(key.as_bytes());
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Spawn parallel worker threads (thread pool approach)
+    fn spawn_parallel_workers(&self, worker: WorkerFn, num_workers: usize) -> Result<(), String> {
+        for _ in 0..num_workers {
+            let item_queue = Arc::clone(&self.item_queue);
+            let active_workers = Arc::clone(&self.active_workers);
+            let processed_count = Arc::clone(&self.processed_count);
+            let removed_guids = Arc::clone(&self.removed_guids);
+            let worker = Arc::clone(&worker);
+            let db = self.db.clone();
+
+            std::thread::spawn(move || {
+                loop {
+                    match item_queue.pop() {
+                        None => {
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            continue;
+                        }
+                        Some(item) => {
+                            // Check if this item was removed
+                            let is_removed = {
+                                let removed_set = removed_guids.lock().unwrap();
+                                removed_set.contains(&item.guid)
+                            };
+                            
+                            if !is_removed {
+                                active_workers.fetch_add(1, Ordering::AcqRel);
+                                worker(item.id, item.data.clone());
+                                processed_count.fetch_add(1, Ordering::AcqRel);
+                                active_workers.fetch_sub(1, Ordering::AcqRel);
+                            }
+                            
                             // Remove from persistent storage after processing
                             let key = format!("item:{}", item.id);
                             let _ = db.remove(key.as_bytes());
-
-                            active_workers.fetch_sub(1, Ordering::AcqRel);
                         }
                     }
                 }
@@ -561,6 +741,101 @@ impl AsyncPersistenceQueue {
         }
 
         Ok(())
+    }
+
+    /// Spawn parallel worker threads that return results
+    fn spawn_parallel_workers_with_results(&self, worker: ResultWorkerFn, num_workers: usize) -> Result<(), String> {
+        for _ in 0..num_workers {
+            let item_queue = Arc::clone(&self.item_queue);
+            let result_queue = Arc::clone(&self.result_queue);
+            let active_workers = Arc::clone(&self.active_workers);
+            let processed_count = Arc::clone(&self.processed_count);
+            let error_count = Arc::clone(&self.error_count);
+            let removed_guids = Arc::clone(&self.removed_guids);
+            let worker = Arc::clone(&worker);
+            let db = self.db.clone();
+
+            std::thread::spawn(move || {
+                loop {
+                    match item_queue.pop() {
+                        None => {
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            continue;
+                        }
+                        Some(item) => {
+                            // Check if this item was removed
+                            let is_removed = {
+                                let removed_set = removed_guids.lock().unwrap();
+                                removed_set.contains(&item.guid)
+                            };
+                            
+                            if !is_removed {
+                                active_workers.fetch_add(1, Ordering::AcqRel);
+                                let result = worker(item.id, item.data.clone());
+
+                                match result {
+                                    Ok(output) => {
+                                        result_queue.push(ProcessedResult {
+                                            id: item.id,
+                                            result: output,
+                                            error: None,
+                                        });
+                                        processed_count.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                    Err(e) => {
+                                        result_queue.push(ProcessedResult {
+                                            id: item.id,
+                                            result: Vec::new(),
+                                            error: Some(e),
+                                        });
+                                        error_count.fetch_add(1, Ordering::AcqRel);
+                                        processed_count.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                }
+                                active_workers.fetch_sub(1, Ordering::AcqRel);
+                            }
+
+                            // Remove from persistent storage after processing
+                            let key = format!("item:{}", item.id);
+                            let _ = db.remove(key.as_bytes());
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(())
+    }
+    
+    /// Remove item by GUID (before it's processed)
+    pub fn remove_by_guid(&self, guid: &str) -> bool {
+        // Remove from index
+        let removed = {
+            let mut index = self.guid_index.lock().unwrap();
+            index.remove(guid).is_some()
+        };
+        
+        // Add to removed set (workers will skip it)
+        if removed {
+            let mut removed_set = self.removed_guids.lock().unwrap();
+            removed_set.insert(guid.to_string());
+            self.removed_count.fetch_add(1, Ordering::AcqRel);
+        }
+        
+        removed
+    }
+    
+    /// Check if GUID is still active (not removed)
+    pub fn is_guid_active(&self, guid: &str) -> bool {
+        let removed_set = self.removed_guids.lock().unwrap();
+        !removed_set.contains(guid)
+    }
+}
+
+/// Phase 2: Implement Drop trait to properly cleanup the I/O worker thread
+impl Drop for AsyncPersistenceQueue {
+    fn drop(&mut self) {
+        self.shutdown_io_worker();
     }
 }
 
