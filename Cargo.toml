@@ -1,6 +1,6 @@
 [package]
 name = "rst_queue"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 authors = ["Suraj Kalbande <suraj202923@gmail.com>"]
 license = "MIT"
@@ -17,8 +17,9 @@ crate-type = ["cdylib"]
 [dependencies]
 crossbeam = { version = "0.8", features = ["crossbeam-queue"] }
 num_cpus = "1.16"
-pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py38"] }
+pyo3 = { version = "0.28.2", features = ["extension-module"] }
 sled = "0.34"
+uuid = { version = "1.7", features = ["v4"] }
 
 [profile.release]
 opt-level = 3

@@ -34,6 +34,7 @@ __email__ = "suraj202923@gmail.com"
 __license__ = "MIT"
 
 from enum import IntEnum
+import warnings
 
 # Try to import the compiled Rust module
 try:
@@ -44,38 +45,38 @@ try:
         PyProcessedResult,
     )
     
+    # Try to import AsyncPriorityQueue if available
+    try:
+        from rst_queue._rst_queue import PyAsyncPriorityQueue
+        AsyncPriorityQueue = PyAsyncPriorityQueue
+    except ImportError:
+        # Fall back to mock if not available
+        from rst_queue.mock_implementation import AsyncPriorityQueue
+    
     # Export with friendly names
     AsyncQueue = PyAsyncQueue
     AsyncPersistenceQueue = PyAsyncPersistenceQueue
     QueueStats = PyQueueStats
     ProcessedResult = PyProcessedResult
     _use_rust = True
-except ImportError:
-    # Fallback to pure Python implementation
-    import sys
-    from pathlib import Path
+except ImportError as e:
+    # Fallback to pure Python mock implementation
+    warnings.warn(
+        "Using pure Python mock implementation. Install from source or use pre-built wheels "
+        "for better performance: pip install --upgrade rst_queue",
+        RuntimeWarning
+    )
     
-    # Try to import pure Python fallback
-    parent_dir = Path(__file__).parent.parent.parent
-    sys.path.insert(0, str(parent_dir))
-    
-    try:
-        # Import from the pure Python implementation
-        # This allows the package to work even if not compiled
-        import warnings
-        warnings.warn(
-            "Using pure Python fallback. Install from source or use pre-built wheels "
-            "for better performance: pip install --upgrade rst_queue",
-            RuntimeWarning
-        )
-        
-        # Define a fallback if needed
-        raise ImportError("Failed to load Rust module")
-    except ImportError:
-        raise ImportError(
-            "rst_queue native module not found. "
-            "Please install it with: pip install rst_queue"
-        )
+    from rst_queue.mock_implementation import (
+        AsyncQueue,
+        AsyncPersistenceQueue,
+        AsyncPriorityQueue,
+        ExecutionMode,
+        Priority,
+        QueueStats,
+        ProcessedResult,
+    )
+    _use_rust = False
 
 
 class ExecutionMode(IntEnum):
@@ -88,9 +89,24 @@ class ExecutionMode(IntEnum):
     PARALLEL = 1
 
 
+class Priority(IntEnum):
+    """Priority levels for queue processing
+    
+    HIGH (2): High priority, processed first
+    NORMAL (1): Normal priority (default)
+    LOW (0): Low priority, processed last
+    """
+    HIGH = 2
+    NORMAL = 1
+    LOW = 0
+
+
 __all__ = [
     "AsyncQueue",
+    "AsyncPersistenceQueue",
+    "AsyncPriorityQueue",
     "ExecutionMode",
+    "Priority",
     "QueueStats",
     "ProcessedResult",
     "__version__",

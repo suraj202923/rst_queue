@@ -1,7 +1,9 @@
 pub mod queue;
 pub mod persistent_queue;
+pub mod priority_queue;
 pub use queue::*;
 pub use persistent_queue::*;
+pub use priority_queue::*;
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyTypeError;
@@ -12,6 +14,7 @@ use std::sync::Arc;
 fn _rst_queue(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncQueue>()?;
     m.add_class::<PyAsyncPersistenceQueue>()?;
+    m.add_class::<PyAsyncPriorityQueue>()?;
     m.add_class::<PyQueueStats>()?;
     m.add_class::<PyProcessedResult>()?;
     m.add("__version__", "0.3.0")?;
@@ -19,6 +22,12 @@ fn _rst_queue(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add constants
     m.add("SEQUENTIAL", 0)?;
     m.add("PARALLEL", 1)?;
+    
+    // Add Priority presets
+    m.add("PRIORITY_LOW", 1)?;
+    m.add("PRIORITY_MEDIUM", 5)?;
+    m.add("PRIORITY_HIGH", 10)?;
+    m.add("PRIORITY_CRITICAL", 20)?;
     
     Ok(())
 }
@@ -150,23 +159,26 @@ impl PyAsyncQueue {
         Ok(PyAsyncQueue { inner: queue })
     }
 
-    /// Push a single item to the queue (lock-free operation)
+    /// Push a single item to the queue (lock-free operation), returns GUID
     ///
     /// Args:
     ///     data: bytes to push to the queue
-    fn push(&self, data: &[u8]) -> PyResult<()> {
+    ///
+    /// Returns:
+    ///     GUID (UUID string) for tracking this item
+    fn push(&self, data: &[u8]) -> PyResult<String> {
         self.inner.push(data.to_vec())
             .map_err(|e| PyTypeError::new_err(e))
     }
 
-    /// Push multiple items in batch (more efficient than individual pushes)
+    /// Push multiple items in batch (more efficient than individual pushes), returns GUIDs
     ///
     /// Args:
     ///     items: list of bytes to push
     ///
     /// Returns:
-    ///     list of item IDs
-    fn push_batch(&self, items: Vec<Vec<u8>>) -> PyResult<Vec<u64>> {
+    ///     list of GUIDs (UUID strings) for tracking items
+    fn push_batch(&self, items: Vec<Vec<u8>>) -> PyResult<Vec<String>> {
         self.inner.push_batch(items)
             .map_err(|e| PyTypeError::new_err(e))
     }
@@ -382,6 +394,28 @@ impl PyAsyncQueue {
         self.inner.get_persistence_path()
             .map(|p| p.to_string_lossy().to_string())
     }
+    
+    /// Remove item by GUID (before it's processed)
+    ///
+    /// Args:
+    ///     guid: The GUID (UUID string) of the item to remove
+    ///
+    /// Returns:
+    ///     True if item was found and removed, False otherwise
+    fn remove_by_guid(&self, guid: &str) -> bool {
+        self.inner.remove_by_guid(guid)
+    }
+    
+    /// Check if a GUID is still active (not removed)
+    ///
+    /// Args:
+    ///     guid: The GUID (UUID string) to check
+    ///
+    /// Returns:
+    ///     True if GUID is active, False if removed
+    fn is_guid_active(&self, guid: &str) -> bool {
+        self.inner.is_guid_active(guid)
+    }
 }
 
 /// Python wrapper for AsyncPersistenceQueue
@@ -407,23 +441,26 @@ impl PyAsyncPersistenceQueue {
         Ok(PyAsyncPersistenceQueue { inner: queue })
     }
 
-    /// Push a single item to the queue and persist it
+    /// Push a single item to the queue and persist it, returns GUID
     ///
     /// Args:
     ///     data: bytes to push to the queue
-    fn push(&self, data: &[u8]) -> PyResult<()> {
+    ///
+    /// Returns:
+    ///     GUID (UUID string) for tracking this item
+    fn push(&self, data: &[u8]) -> PyResult<String> {
         self.inner.push(data.to_vec())
             .map_err(|e| PyTypeError::new_err(e))
     }
 
-    /// Push multiple items in batch (more efficient than individual pushes)
+    /// Push multiple items in batch (more efficient than individual pushes), returns GUIDs
     ///
     /// Args:
     ///     items: list of bytes to push
     ///
     /// Returns:
-    ///     list of item IDs
-    fn push_batch(&self, items: Vec<Vec<u8>>) -> PyResult<Vec<u64>> {
+    ///     list of GUIDs (UUID strings) for tracking items
+    fn push_batch(&self, items: Vec<Vec<u8>>) -> PyResult<Vec<String>> {
         self.inner.push_batch(items)
             .map_err(|e| PyTypeError::new_err(e))
     }
@@ -629,6 +666,279 @@ impl PyAsyncPersistenceQueue {
         }
         count
     }
+    
+    /// Remove item by GUID (before it's processed)
+    ///
+    /// Args:
+    ///     guid: The GUID (UUID string) of the item to remove
+    ///
+    /// Returns:
+    ///     True if item was found and removed, False otherwise
+    fn remove_by_guid(&self, guid: &str) -> bool {
+        self.inner.remove_by_guid(guid)
+    }
+    
+    /// Check if a GUID is still active (not removed)
+    ///
+    /// Args:
+    ///     guid: The GUID (UUID string) to check
+    ///
+    /// Returns:
+    ///     True if GUID is active, False if removed
+    fn is_guid_active(&self, guid: &str) -> bool {
+        self.inner.is_guid_active(guid)
+    }
 }
+
+/// Python wrapper for AsyncPriorityQueue
+/// Priority-based async queue with GUID tracking and changeable priorities
+#[pyclass(module = "rst_queue._rst_queue")]
+pub struct PyAsyncPriorityQueue {
+    inner: AsyncPriorityQueue,
+}
+
+#[pymethods]
+impl PyAsyncPriorityQueue {
+    /// Create a new AsyncPriorityQueue with GUID support
+    ///
+    /// Args:
+    ///     mode: 0 for SEQUENTIAL, 1 for PARALLEL (default: 1)
+    ///     storage_path: Path to Sled database (default: "./priority_queue_storage")
+    #[new]
+    #[pyo3(signature = (mode = 1, storage_path = "./priority_queue_storage"))]
+    fn new(mode: u8, storage_path: &str) -> PyResult<Self> {
+        let queue = AsyncPriorityQueue::new(mode, storage_path)
+            .map_err(|e| PyTypeError::new_err(e))?;
+        Ok(PyAsyncPriorityQueue { inner: queue })
+    }
+
+    /// Push item with custom priority level (1-100), returns GUID
+    ///
+    /// Args:
+    ///     data: bytes to push to the queue
+    ///     priority: Priority level 1-100 (higher = more important)
+    ///
+    /// Returns:
+    ///     GUID (UUID string) for tracking this item
+    fn push_with_priority(&self, data: &[u8], priority: u8) -> PyResult<String> {
+        let p = Priority::custom(priority)
+            .map_err(|e| PyTypeError::new_err(e))?;
+        
+        self.inner.push_with_priority(data.to_vec(), p)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Push with preset priority level, returns GUID
+    ///
+    /// Args:
+    ///     data: bytes to push to the queue
+    ///     preset_name: "low", "medium", "high", or "critical"
+    ///
+    /// Returns:
+    ///     GUID (UUID string) for tracking this item
+    fn push_with_preset_priority(&self, data: &[u8], preset_name: &str) -> PyResult<String> {
+        let priority = match preset_name.to_lowercase().as_str() {
+            "low" => Priority::LOW,
+            "medium" => Priority::MEDIUM,
+            "high" => Priority::HIGH,
+            "critical" => Priority::CRITICAL,
+            _ => return Err(PyTypeError::new_err(
+                "Invalid preset: use 'low', 'medium', 'high', or 'critical'"
+            )),
+        };
+        
+        self.inner.push_with_priority(data.to_vec(), priority)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Push batch with same priority level, returns list of GUIDs
+    ///
+    /// Args:
+    ///     items: list of bytes to push to the queue
+    ///     priority: Priority level 1-100
+    ///
+    /// Returns:
+    ///     List of GUIDs (UUID strings) for tracking items
+    fn push_batch_with_priority(&self, items: Vec<Vec<u8>>, priority: u8) -> PyResult<Vec<String>> {
+        let p = Priority::custom(priority)
+            .map_err(|e| PyTypeError::new_err(e))?;
+        
+        self.inner.push_batch_with_priority(items, p)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Push batch with preset priority, returns list of GUIDs
+    ///
+    /// Args:
+    ///     items: list of bytes to push to the queue
+    ///     preset_name: "low", "medium", "high", or "critical"
+    ///
+    /// Returns:
+    ///     List of GUIDs (UUID strings) for tracking items
+    fn push_batch_with_preset_priority(
+        &self,
+        items: Vec<Vec<u8>>,
+        preset_name: &str,
+    ) -> PyResult<Vec<String>> {
+        let priority = match preset_name.to_lowercase().as_str() {
+            "low" => Priority::LOW,
+            "medium" => Priority::MEDIUM,
+            "high" => Priority::HIGH,
+            "critical" => Priority::CRITICAL,
+            _ => return Err(PyTypeError::new_err(
+                "Invalid preset: use 'low', 'medium', 'high', or 'critical'"
+            )),
+        };
+        
+        self.inner.push_batch_with_priority(items, priority)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Get next item (highest priority first)
+    ///
+    /// Returns:
+    ///     Tuple of (guid, data, priority_level) or None if queue is empty
+    fn get_next(&self) -> Option<(String, Vec<u8>, u8)> {
+        self.inner.get_next().map(|(guid, data, priority)| {
+            (guid, data, priority.get_level())
+        })
+    }
+
+    /// Peek at next item without removing it
+    ///
+    /// Returns:
+    ///     Tuple of (guid, priority_level) or None if queue is empty
+    fn peek_next(&self) -> Option<(String, u8)> {
+        self.inner.peek_next().map(|(guid, priority)| {
+            (guid, priority.get_level())
+        })
+    }
+
+    /// Update priority of queued item by GUID
+    ///
+    /// Args:
+    ///     item_guid: GUID of the item to update
+    ///     new_priority: New priority level 1-100
+    ///
+    /// Returns:
+    ///     True if item found and updated, False if not found or already processed
+    fn update_priority(&self, item_guid: &str, new_priority: u8) -> PyResult<bool> {
+        let p = Priority::custom(new_priority)
+            .map_err(|e| PyTypeError::new_err(e))?;
+        Ok(self.inner.update_priority(item_guid, p))
+    }
+
+    /// Get current priority of item by GUID
+    ///
+    /// Args:
+    ///     item_guid: GUID of the item
+    ///
+    /// Returns:
+    ///     Priority level (1-100) or None if not found
+    fn get_priority(&self, item_guid: &str) -> Option<u8> {
+        self.inner.get_priority(item_guid).map(|p| p.get_level())
+    }
+
+    /// Remove item from queue by GUID (before it's processed)
+    ///
+    /// Args:
+    ///     item_guid: GUID of the item to remove
+    ///
+    /// Returns:
+    ///     True if item found and removed, False if not found or already processed
+    fn remove_by_guid(&self, item_guid: &str) -> bool {
+        self.inner.remove_by_guid(item_guid)
+    }
+
+    /// Get priority statistics for current queue
+    ///
+    /// Returns:
+    ///     Dictionary mapping priority levels to item counts
+    fn get_priority_stats(&self) -> std::collections::HashMap<u8, usize> {
+        let stats = self.inner.get_priority_stats();
+        stats.by_priority_level
+    }
+
+    /// Get total number of items currently in queue
+    ///
+    /// Returns:
+    ///     Number of items waiting to be processed
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Check if queue is empty
+    ///
+    /// Returns:
+    ///     True if queue has no items
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Get total items processed
+    ///
+    /// Returns:
+    ///     Count of processed items
+    fn get_processed_count(&self) -> u64 {
+        self.inner.get_processed_count()
+    }
+
+    /// Close the queue (prevent new items from being added)
+    fn close(&self) {
+        self.inner.close();
+    }
+
+    /// Flush to disk to ensure durability
+    ///
+    /// Returns:
+    ///     None on success, raises error on failure
+    fn flush(&self) -> PyResult<()> {
+        self.inner.flush()
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+    
+    /// Start processing with a worker callback
+    ///
+    /// Args:
+    ///     worker: A callable that accepts (guid: str, data: bytes, priority: int)
+    ///     num_workers: Number of parallel workers
+    fn start(&self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
+        let worker_fn = Arc::new(move |guid: String, data: Vec<u8>, priority: Priority| {
+            if let Some(_) = pyo3::Python::try_attach(|py| {
+                let py_bytes = pyo3::types::PyBytes::new(py, &data);
+                match worker.call1(py, (guid, py_bytes, priority.get_level())) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        eprintln!("[ERROR] Worker execution error: {}", e);
+                    }
+                }
+            }) {
+                // Successfully executed
+            } else {
+                eprintln!("[ERROR] Failed to acquire GIL");
+            }
+        });
+
+        // Spawn workers that process items from the queue
+        for _ in 0..num_workers {
+            let inner = Arc::new(self.inner.clone());
+            let worker = worker_fn.clone();
+            
+            std::thread::spawn(move || {
+                loop {
+                    if let Some((guid, data, priority)) = inner.get_next() {
+                        worker(guid, data, priority);
+                        inner.increment_processed();
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
+                }
+            });
+        }
+
+        Ok(())
+    }
+}
+
 
 
