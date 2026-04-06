@@ -1,5 +1,7 @@
 pub mod queue;
+pub mod persistent_queue;
 pub use queue::*;
+pub use persistent_queue::*;
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyTypeError;
@@ -9,9 +11,10 @@ use std::sync::Arc;
 #[pymodule]
 fn _rst_queue(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncQueue>()?;
+    m.add_class::<PyAsyncPersistenceQueue>()?;
     m.add_class::<PyQueueStats>()?;
     m.add_class::<PyProcessedResult>()?;
-    m.add("__version__", "0.2.0")?;
+    m.add("__version__", "0.3.0")?;
     
     // Add constants
     m.add("SEQUENTIAL", 0)?;
@@ -125,6 +128,24 @@ impl PyAsyncQueue {
     #[pyo3(signature = (mode = 1, buffer_size = 128))]
     fn new(mode: u8, buffer_size: usize) -> PyResult<Self> {
         let queue = AsyncQueue::new(mode, buffer_size)
+            .map_err(|e| PyTypeError::new_err(e))?;
+        Ok(PyAsyncQueue { inner: queue })
+    }
+
+    /// Create a new AsyncQueue with persistence enabled
+    ///
+    /// Args:
+    ///     mode: 0 for SEQUENTIAL, 1 for PARALLEL
+    ///     buffer_size: Queue buffer size (informational)
+    ///     storage_path: Path to store persisted data (e.g., "./queue_data")
+    ///     auto_restore: If True, loads items from disk on initialization
+    ///
+    /// Returns:
+    ///     PyAsyncQueue instance with persistence enabled
+    #[staticmethod]
+    #[pyo3(signature = (mode = 1, buffer_size = 128, storage_path = "./queue_data", auto_restore = true))]
+    fn new_with_persistence(mode: u8, buffer_size: usize, storage_path: &str, auto_restore: bool) -> PyResult<Self> {
+        let mut queue = AsyncQueue::new_with_persistence(mode, buffer_size, storage_path, auto_restore)
             .map_err(|e| PyTypeError::new_err(e))?;
         Ok(PyAsyncQueue { inner: queue })
     }
@@ -332,5 +353,282 @@ impl PyAsyncQueue {
         self.inner.start_with_results(worker_fn, num_workers)
             .map_err(|e| PyTypeError::new_err(e))
     }
+
+    /// Save all pending items to disk using bincode serialization
+    ///
+    /// Serializes queue items and results to binary format for storage.
+    /// Must have been created with persistence enabled.
+    ///
+    /// Returns:
+    ///     None on success, raises error on failure
+    fn save_to_disk(&self) -> PyResult<()> {
+        self.inner.save_to_disk()
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Check if this queue has persistence enabled
+    ///
+    /// Returns:
+    ///     True if created with persistence, False otherwise
+    fn is_persistent(&self) -> bool {
+        self.inner.is_persistent()
+    }
+
+    /// Get the persistence storage path
+    ///
+    /// Returns:
+    ///     Path string if persistence is enabled, None otherwise
+    fn get_persistence_path(&self) -> Option<String> {
+        self.inner.get_persistence_path()
+            .map(|p| p.to_string_lossy().to_string())
+    }
 }
+
+/// Python wrapper for AsyncPersistenceQueue
+/// Same API as AsyncQueue but with persistent Sled backing store
+#[pyclass(module = "rst_queue._rst_queue")]
+pub struct PyAsyncPersistenceQueue {
+    inner: AsyncPersistenceQueue,
+}
+
+#[pymethods]
+impl PyAsyncPersistenceQueue {
+    /// Create a new AsyncPersistenceQueue with Sled persistence
+    ///
+    /// Args:
+    ///     mode: 0 for SEQUENTIAL, 1 for PARALLEL (default: 1)
+    ///     buffer_size: Ignored (kept for API compatibility)
+    ///     storage_path: Path to Sled database (default: "./queue_storage")
+    #[new]
+    #[pyo3(signature = (mode = 1, buffer_size = 128, storage_path = "./queue_storage"))]
+    fn new(mode: u8, buffer_size: usize, storage_path: &str) -> PyResult<Self> {
+        let queue = AsyncPersistenceQueue::new(mode, buffer_size, storage_path)
+            .map_err(|e| PyTypeError::new_err(e))?;
+        Ok(PyAsyncPersistenceQueue { inner: queue })
+    }
+
+    /// Push a single item to the queue and persist it
+    ///
+    /// Args:
+    ///     data: bytes to push to the queue
+    fn push(&self, data: &[u8]) -> PyResult<()> {
+        self.inner.push(data.to_vec())
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Push multiple items in batch (more efficient than individual pushes)
+    ///
+    /// Args:
+    ///     items: list of bytes to push
+    ///
+    /// Returns:
+    ///     list of item IDs
+    fn push_batch(&self, items: Vec<Vec<u8>>) -> PyResult<Vec<u64>> {
+        self.inner.push_batch(items)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Get the current execution mode
+    ///
+    /// Returns:
+    ///     0 for SEQUENTIAL, 1 for PARALLEL
+    fn get_mode(&self) -> u8 {
+        self.inner.get_mode()
+    }
+
+    /// Set the execution mode
+    ///
+    /// Args:
+    ///     mode: 0 for SEQUENTIAL, 1 for PARALLEL
+    fn set_mode(&self, mode: u8) -> PyResult<()> {
+        self.inner.set_mode(mode)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Get number of currently active workers
+    fn active_workers(&self) -> usize {
+        self.inner.active_workers()
+    }
+
+    /// Get total items pushed to the queue since creation
+    fn total_pushed(&self) -> u64 {
+        self.inner.total_pushed()
+    }
+
+    /// Get total items processed
+    fn total_processed(&self) -> u64 {
+        self.inner.total_processed()
+    }
+
+    /// Get total errors during processing
+    fn total_errors(&self) -> u64 {
+        self.inner.total_errors()
+    }
+
+    /// Get queue statistics as a snapshot
+    fn get_stats(&self) -> PyResult<PyQueueStats> {
+        let stats = self.inner.get_stats();
+        Ok(PyQueueStats {
+            total_pushed: stats.total_pushed,
+            total_processed: stats.total_processed,
+            total_errors: stats.total_errors,
+            total_removed: stats.total_removed,
+            active_workers: stats.active_workers,
+        })
+    }
+
+    /// Start processing queue items (fire-and-forget mode)
+    ///
+    /// Args:
+    ///     worker: A callable that accepts (item_id: int, data: bytes)
+    ///     num_workers: Number of parallel workers (auto-scaling to CPU cores)
+    fn start(&mut self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
+        let worker_fn = Arc::new(move |id: u64, data: Vec<u8>| {
+            // Use try_attach to safely acquire GIL in background thread
+            if let Some(_) = pyo3::Python::try_attach(|py| {
+                let py_bytes = pyo3::types::PyBytes::new(py, &data);
+                match worker.call1(py, (id, py_bytes)) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        eprintln!("[ERROR] Worker execution error for item {}: {}", id, e);
+                    }
+                }
+            }) {
+                // Successfully executed
+            } else {
+                eprintln!("[ERROR] Failed to acquire GIL for item {}", id);
+            }
+        });
+
+        self.inner.start(worker_fn, num_workers)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Get a processed result (non-blocking)
+    ///
+    /// Returns:
+    ///     ProcessedResult or None if no results available
+    fn get(&self) -> Option<PyProcessedResult> {
+        self.inner.get().map(|r| PyProcessedResult {
+            id: r.id,
+            result: r.result,
+            error: r.error,
+        })
+    }
+
+    /// Get multiple results in batch (non-blocking)
+    ///
+    /// Args:
+    ///     max_items: Maximum number of results to retrieve
+    ///
+    /// Returns:
+    ///     List of ProcessedResult objects (empty if none available)
+    fn get_batch(&self, max_items: usize) -> Vec<PyProcessedResult> {
+        self.inner.get_batch(max_items)
+            .into_iter()
+            .map(|r| PyProcessedResult {
+                id: r.id,
+                result: r.result,
+                error: r.error,
+            })
+            .collect()
+    }
+
+    /// Get a processed result (blocking)
+    ///
+    /// Blocks until a result is available using spin-wait with backoff.
+    /// Automatically releases GIL to allow worker threads to execute.
+    ///
+    /// Returns:
+    ///     ProcessedResult
+    fn get_blocking(&self, _py: Python<'_>) -> PyResult<PyProcessedResult> {
+        let result = self.inner.get_blocking()
+            .map_err(|e| PyTypeError::new_err(e))?;
+        
+        Ok(PyProcessedResult {
+            id: result.id,
+            result: result.result,
+            error: result.error,
+        })
+    }
+
+    /// Close the queue (prevent new items from being added)
+    fn close(&self) {
+        self.inner.close();
+    }
+
+    /// Clear all pending items from the queue and Sled storage
+    ///
+    /// Returns the number of items removed.
+    fn clear(&self) -> usize {
+        self.inner.clear()
+    }
+
+    /// Get the number of pending items waiting in the queue
+    ///
+    /// Returns an estimate of pending items.
+    fn pending_items(&self) -> usize {
+        self.inner.pending_items()
+    }
+
+    /// Start processing with a worker that returns results
+    ///
+    /// Args:
+    ///     worker: A callable that accepts (item_id: int, data: bytes) and returns bytes
+    ///     num_workers: Number of parallel workers (auto-scaling to CPU cores)
+    ///
+    /// Results can be retrieved via get() or get_blocking()
+    fn start_with_results(&mut self, _py: Python<'_>, worker: Py<PyAny>, num_workers: usize) -> PyResult<()> {
+        let worker_fn = Arc::new(move |id: u64, data: Vec<u8>| -> Result<Vec<u8>, String> {
+            // Use try_attach to safely acquire GIL in background thread
+            pyo3::Python::try_attach(|py| {
+                let py_bytes = pyo3::types::PyBytes::new(py, &data);
+                
+                match worker.call1(py, (id, py_bytes)) {
+                    Ok(result) => {
+                        // Try to extract bytes from the result
+                        match result.extract::<Vec<u8>>(py) {
+                            Ok(bytes) => Ok(bytes),
+                            Err(_) => {
+                                // Try to extract as string
+                                match result.extract::<String>(py) {
+                                    Ok(s) => Ok(s.into_bytes()),
+                                    Err(e) => {
+                                        Err(format!("Failed to extract result: expected bytes or string, got {}", e))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => Err(format!("Worker execution error for item {}: {}", id, e)),
+                }
+            }).ok_or_else(|| "Failed to acquire GIL".to_string())?
+        });
+
+        self.inner.start_with_results(worker_fn, num_workers)
+            .map_err(|e| PyTypeError::new_err(e))
+    }
+
+    /// Get the storage path for this persistent queue
+    ///
+    /// Returns:
+    ///     Path to the Sled database
+    fn get_storage_path(&self) -> String {
+        self.inner.storage_path.to_string_lossy().to_string()
+    }
+
+    /// Check total items in Sled storage (includes both processed and pending)
+    ///
+    /// Returns:
+    ///     Count of all items in persistent store
+    fn storage_item_count(&self) -> u64 {
+        let mut count = 0;
+        let mut iter = self.inner.db.scan_prefix(b"item:");
+        while let Some(Ok(_)) = iter.next() {
+            count += 1;
+        }
+        count
+    }
+}
+
 

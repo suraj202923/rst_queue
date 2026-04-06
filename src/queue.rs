@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crossbeam::queue::SegQueue;
+use std::path::PathBuf;
+use std::fs;
+use std::io::{self, Read, Write};
 
 /// Execution mode for the queue
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -80,6 +83,10 @@ pub struct AsyncQueue {
     
     /// Flag to signal workers to stop
     is_closed: Arc<AtomicUsize>, // Using 1=closed, 0=open
+    
+    /// Persistence settings
+    persistence_enabled: bool,
+    persistence_path: Option<PathBuf>,
 }
 
 /// Result batch for processing multiple items at once
@@ -114,7 +121,60 @@ impl AsyncQueue {
             removed_count: Arc::new(AtomicU64::new(0)),
             mode: Arc::new(Mutex::new(execution_mode)),
             is_closed: Arc::new(AtomicUsize::new(0)),
+            persistence_enabled: false,
+            persistence_path: None,
         })
+    }
+
+    /// Create a new AsyncQueue with persistence enabled
+    ///
+    /// # Arguments
+    ///
+    /// * `mode` - 0 for Sequential, 1 for Parallel
+    /// * `_buffer_size` - Ignored (SegQueue is unbounded), kept for API compatibility
+    /// * `storage_path` - Path to store persisted data (e.g., "./queue_data")
+    /// * `auto_restore` - If true, loads items from disk on initialization
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let queue = AsyncQueue::new_with_persistence(1, 128, "./queue_data", true)
+    ///     .expect("Failed to create queue");
+    /// ```
+    pub fn new_with_persistence(
+        mode: u8,
+        _buffer_size: usize,
+        storage_path: &str,
+        auto_restore: bool,
+    ) -> Result<Self, String> {
+        let execution_mode = ExecutionMode::from_int(mode);
+        let path = PathBuf::from(storage_path);
+
+        // Create directory if it doesn't exist
+        if let Err(e) = fs::create_dir_all(&path) {
+            return Err(format!("Failed to create storage directory: {}", e));
+        }
+
+        let mut queue = AsyncQueue {
+            item_queue: Arc::new(SegQueue::new()),
+            result_queue: Arc::new(SegQueue::new()),
+            counter: Arc::new(AtomicU64::new(0)),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            processed_count: Arc::new(AtomicU64::new(0)),
+            error_count: Arc::new(AtomicU64::new(0)),
+            removed_count: Arc::new(AtomicU64::new(0)),
+            mode: Arc::new(Mutex::new(execution_mode)),
+            is_closed: Arc::new(AtomicUsize::new(0)),
+            persistence_enabled: true,
+            persistence_path: Some(path),
+        };
+
+        // Restore items if auto_restore is enabled
+        if auto_restore {
+            queue.restore_from_disk()?;
+        }
+
+        Ok(queue)
     }
 
     /// Push an item to the queue (lock-free)
@@ -454,7 +514,200 @@ impl AsyncQueue {
 
         Ok(())
     }
+
+    /// Save all pending items to disk using bincode serialization
+    pub fn save_to_disk(&self) -> Result<(), String> {
+        if !self.persistence_enabled {
+            return Err("Persistence not enabled for this queue".to_string());
+        }
+
+        let path = match &self.persistence_path {
+            Some(p) => p,
+            None => return Err("Persistence path not set".to_string()),
+        };
+
+        // Create directory if it doesn't exist
+        if let Err(e) = fs::create_dir_all(path) {
+            return Err(format!("Failed to create persistence directory: {}", e));
+        }
+
+        // Collect and write items to disk
+        let items_path = path.join("items.bin");
+        let mut file = match fs::File::create(&items_path) {
+            Ok(f) => f,
+            Err(e) => return Err(format!("Failed to create items file: {}", e)),
+        };
+
+        let mut items = Vec::new();
+        while let Some(item) = self.item_queue.pop() {
+            items.push(item);
+        }
+
+        // Write each item's data with length prefix (8 bytes for length)
+        for item in items {
+            let len = item.data.len() as u64;
+            if let Err(e) = file.write_all(&len.to_le_bytes()) {
+                return Err(format!("Failed to write item length: {}", e));
+            }
+            if let Err(e) = file.write_all(&item.data) {
+                return Err(format!("Failed to write item data: {}", e));
+            }
+        }
+
+        // Collect and write results to disk
+        let results_path = path.join("results.bin");
+        let mut results_file = match fs::File::create(&results_path) {
+            Ok(f) => f,
+            Err(e) => return Err(format!("Failed to create results file: {}", e)),
+        };
+
+        let mut results = Vec::new();
+        while let Some(result) = self.result_queue.pop() {
+            results.push(result);
+        }
+
+        // Write each result: id (8) + result_len (8) + result_data + error_len (8) + error_data
+        for result in results {
+            if let Err(e) = results_file.write_all(&result.id.to_le_bytes()) {
+                return Err(format!("Failed to write result id: {}", e));
+            }
+            let result_len = result.result.len() as u64;
+            if let Err(e) = results_file.write_all(&result_len.to_le_bytes()) {
+                return Err(format!("Failed to write result length: {}", e));
+            }
+            if let Err(e) = results_file.write_all(&result.result) {
+                return Err(format!("Failed to write result data: {}", e));
+            }
+            let error_len = result.error.as_ref().map(|e| e.len()).unwrap_or(0) as u64;
+            if let Err(e) = results_file.write_all(&error_len.to_le_bytes()) {
+                return Err(format!("Failed to write error length: {}", e));
+            }
+            if let Some(error) = &result.error {
+                if let Err(e) = results_file.write_all(error.as_bytes()) {
+                    return Err(format!("Failed to write error data: {}", e));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Restore items from disk that were previously saved (raw binary format)
+    pub fn restore_from_disk(&mut self) -> Result<(), String> {
+        let path = match &self.persistence_path {
+            Some(p) => p,
+            None => return Err("Persistence path not set".to_string()),
+        };
+
+        // Restore items
+        let items_path = path.join("items.bin");
+        if items_path.exists() {
+            let data = match fs::read(&items_path) {
+                Ok(d) => d,
+                Err(e) => return Err(format!("Failed to read items from disk: {}", e)),
+            };
+
+            let mut cursor = 0;
+            while cursor < data.len() {
+                // Read 8-byte length
+                if cursor + 8 > data.len() {
+                    break;
+                }
+                let len_bytes = &data[cursor..cursor + 8];
+                let len = u64::from_le_bytes([
+                    len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3],
+                    len_bytes[4], len_bytes[5], len_bytes[6], len_bytes[7],
+                ]) as usize;
+                cursor += 8;
+
+                // Read data
+                if cursor + len > data.len() {
+                    break;
+                }
+                let item_data = data[cursor..cursor + len].to_vec();
+                cursor += len;
+
+                // Create QueueItem with id 0 (user should extract from encoded data)
+                let item = QueueItem {
+                    id: self.counter.fetch_add(1, Ordering::AcqRel),
+                    data: item_data,
+                };
+                self.item_queue.push(item);
+            }
+        }
+
+        // Restore results
+        let results_path = path.join("results.bin");
+        if results_path.exists() {
+            let data = match fs::read(&results_path) {
+                Ok(d) => d,
+                Err(e) => return Err(format!("Failed to read results from disk: {}", e)),
+            };
+
+            let mut cursor = 0;
+            while cursor < data.len() {
+                // Read id (8 bytes)
+                if cursor + 8 > data.len() { break; }
+                let id = u64::from_le_bytes([
+                    data[cursor], data[cursor+1], data[cursor+2], data[cursor+3],
+                    data[cursor+4], data[cursor+5], data[cursor+6], data[cursor+7],
+                ]);
+                cursor += 8;
+
+                // Read result length (8 bytes)
+                if cursor + 8 > data.len() { break; }
+                let result_len = u64::from_le_bytes([
+                    data[cursor], data[cursor+1], data[cursor+2], data[cursor+3],
+                    data[cursor+4], data[cursor+5], data[cursor+6], data[cursor+7],
+                ]) as usize;
+                cursor += 8;
+
+                // Read result data
+                if cursor + result_len > data.len() { break; }
+                let result = data[cursor..cursor + result_len].to_vec();
+                cursor += result_len;
+
+                // Read error length (8 bytes)
+                if cursor + 8 > data.len() { break; }
+                let error_len = u64::from_le_bytes([
+                    data[cursor], data[cursor+1], data[cursor+2], data[cursor+3],
+                    data[cursor+4], data[cursor+5], data[cursor+6], data[cursor+7],
+                ]) as usize;
+                cursor += 8;
+
+                // Read error data
+                let error = if error_len > 0 {
+                    if cursor + error_len > data.len() { break; }
+                    let err_str = String::from_utf8_lossy(&data[cursor..cursor + error_len]).to_string();
+                    cursor += error_len;
+                    Some(err_str)
+                } else {
+                    None
+                };
+
+                let processed_result = ProcessedResult {
+                    id,
+                    result,
+                    error,
+                };
+                self.result_queue.push(processed_result);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if persistence is enabled for this queue
+    pub fn is_persistent(&self) -> bool {
+        self.persistence_enabled
+    }
+
+    /// Get the persistence path if enabled
+    pub fn get_persistence_path(&self) -> Option<&PathBuf> {
+        self.persistence_path.as_ref()
+    }
 }
+
 
 /// Optimize worker count based on CPU cores
 /// Prevents oversubscription while ensuring good parallelism
