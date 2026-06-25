@@ -55,6 +55,9 @@ pub struct AsyncPersistenceQueue {
     
     /// Flag to signal workers to stop
     is_closed: Arc<AtomicUsize>, // Using 1=closed, 0=open
+
+    /// Guard to prevent spawning duplicate worker pools
+    workers_started: Arc<AtomicUsize>,
     
     /// Storage path
     pub storage_path: PathBuf,
@@ -180,6 +183,7 @@ impl AsyncPersistenceQueue {
             guid_index: Arc::new(Mutex::new(HashMap::new())),
             removed_guids: Arc::new(Mutex::new(HashSet::new())),
             is_closed: Arc::new(AtomicUsize::new(0)),
+            workers_started: Arc::new(AtomicUsize::new(0)),
             storage_path: path,
             io_sender: tx,
             io_thread: Some(io_thread),
@@ -556,6 +560,10 @@ impl AsyncPersistenceQueue {
 
     /// Start the queue with a worker function that returns results
     pub fn start_with_results(&mut self, worker: ResultWorkerFn, num_workers: usize) -> Result<(), String> {
+        if self.workers_started.swap(1, Ordering::AcqRel) != 0 {
+            return Err("Workers already started for this queue instance".to_string());
+        }
+
         let mode = self.mode.lock().unwrap().clone();
         let num_workers = optimize_worker_count(num_workers);
 
@@ -573,6 +581,10 @@ impl AsyncPersistenceQueue {
 
     /// Start the queue with a fire-and-forget worker function
     pub fn start(&mut self, worker: WorkerFn, num_workers: usize) -> Result<(), String> {
+        if self.workers_started.swap(1, Ordering::AcqRel) != 0 {
+            return Err("Workers already started for this queue instance".to_string());
+        }
+
         let mode = self.mode.lock().unwrap().clone();
         let num_workers = optimize_worker_count(num_workers);
 
@@ -594,13 +606,17 @@ impl AsyncPersistenceQueue {
         let active_workers = Arc::clone(&self.active_workers);
         let processed_count = Arc::clone(&self.processed_count);
         let removed_guids = Arc::clone(&self.removed_guids);
+        let is_closed = Arc::clone(&self.is_closed);
         let db = self.db.clone();
 
         std::thread::spawn(move || {
             loop {
                 match item_queue.pop() {
                     None => {
-                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        if is_closed.load(Ordering::Acquire) != 0 {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
                     Some(item) => {
@@ -636,13 +652,17 @@ impl AsyncPersistenceQueue {
         let processed_count = Arc::clone(&self.processed_count);
         let error_count = Arc::clone(&self.error_count);
         let removed_guids = Arc::clone(&self.removed_guids);
+        let is_closed = Arc::clone(&self.is_closed);
         let db = self.db.clone();
 
         std::thread::spawn(move || {
             loop {
                 match item_queue.pop() {
                     None => {
-                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        if is_closed.load(Ordering::Acquire) != 0 {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
                     Some(item) => {
@@ -696,6 +716,7 @@ impl AsyncPersistenceQueue {
             let active_workers = Arc::clone(&self.active_workers);
             let processed_count = Arc::clone(&self.processed_count);
             let removed_guids = Arc::clone(&self.removed_guids);
+            let is_closed = Arc::clone(&self.is_closed);
             let worker = Arc::clone(&worker);
             let db = self.db.clone();
 
@@ -703,7 +724,10 @@ impl AsyncPersistenceQueue {
                 loop {
                     match item_queue.pop() {
                         None => {
-                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            if is_closed.load(Ordering::Acquire) != 0 {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                             continue;
                         }
                         Some(item) => {
@@ -741,6 +765,7 @@ impl AsyncPersistenceQueue {
             let processed_count = Arc::clone(&self.processed_count);
             let error_count = Arc::clone(&self.error_count);
             let removed_guids = Arc::clone(&self.removed_guids);
+            let is_closed = Arc::clone(&self.is_closed);
             let worker = Arc::clone(&worker);
             let db = self.db.clone();
 
@@ -748,7 +773,10 @@ impl AsyncPersistenceQueue {
                 loop {
                     match item_queue.pop() {
                         None => {
-                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            if is_closed.load(Ordering::Acquire) != 0 {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                             continue;
                         }
                         Some(item) => {
