@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
-use crossbeam::channel::{bounded, Sender};
+use crossbeam::channel::{bounded, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::path::PathBuf;
 
@@ -116,7 +116,7 @@ impl AsyncPriorityQueue {
         let io_thread = thread::spawn(move || {
             let mut last_flush = std::time::Instant::now();
             loop {
-                match rx.try_recv() {
+                match rx.recv_timeout(Duration::from_millis(10)) {
                     Ok(op) => {
                         match op {
                             IoOperation::Insert { key, value } => {
@@ -131,13 +131,16 @@ impl AsyncPriorityQueue {
                         }
                         last_flush = std::time::Instant::now();
                     }
-                    Err(_) => {
+                    Err(RecvTimeoutError::Timeout) => {
                         // Flush every 100ms for durability
                         if last_flush.elapsed() > Duration::from_millis(100) {
                             let _ = db_clone.flush();
                             last_flush = std::time::Instant::now();
                         }
-                        thread::sleep(Duration::from_micros(100));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let _ = db_clone.flush();
+                        break;
                     }
                 }
             }
@@ -376,6 +379,11 @@ impl AsyncPriorityQueue {
     /// Close the queue
     pub fn close(&self) {
         self.is_closed.store(1, AtomicOrdering::Release);
+    }
+
+    /// Check whether queue has been closed
+    pub fn is_closed(&self) -> bool {
+        self.is_closed.load(AtomicOrdering::Acquire) != 0
     }
     
     /// Flush to disk

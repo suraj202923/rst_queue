@@ -930,7 +930,10 @@ impl PyAsyncPriorityQueue {
                         worker(guid, data, priority);
                         inner.increment_processed();
                     } else {
-                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        if inner.is_closed() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 }
             });
