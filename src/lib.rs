@@ -17,7 +17,7 @@ fn _rst_queue(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncPriorityQueue>()?;
     m.add_class::<PyQueueStats>()?;
     m.add_class::<PyProcessedResult>()?;
-    m.add("__version__", "0.1.8")?;
+    m.add("__version__", "0.1.9")?;
     
     // Add constants
     m.add("SEQUENTIAL", 0)?;
@@ -930,7 +930,10 @@ impl PyAsyncPriorityQueue {
                         worker(guid, data, priority);
                         inner.increment_processed();
                     } else {
-                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        if inner.is_closed() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 }
             });
